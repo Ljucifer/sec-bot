@@ -1,0 +1,30 @@
+services:
+  sec-bot:
+    build: .
+    container_name: sec-bot
+    restart: unless-stopped
+
+    # Секреты не хардкодятся в compose-файле, а читаются из .env:
+    # `env_file` передаёт переменные внутрь контейнера,
+    # а `${...}` в environment подставляет их при сборке конфигурации.
+    # Файл .env должен лежать рядом с docker-compose.yml.
+    env_file:
+      - .env
+
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+
+    # История отправленных новостей живёт в файле на хосте, поэтому
+    # переживает пересоздание контейнера (docker compose up --build).
+    # Файл должен существовать до запуска, иначе Docker создаст каталог.
+    volumes:
+      - ./seen_urls.json:/app/seen_urls.json
+
+    # Ограничиваем рост логов, чтобы диск не забился за месяцы работы.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
