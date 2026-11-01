@@ -1,3 +1,4 @@
-feedparser
-requests
-openai
+feedparser==6.0.14
+feedparser-sgmllib==2.1.0
+openai==3.42.0
+requests==2.34.2
