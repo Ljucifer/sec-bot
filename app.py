@@ -25,7 +25,7 @@ import time
 
 import feedparser
 import requests
-from openai import OpenAI
+from openai import OpenAI, AuthenticationError
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -64,6 +64,9 @@ HTTP_TIMEOUT = 20
 # Лимит длины сообщения в Telegram.
 TELEGRAM_MAX_LENGTH = 4096
 
+# Максимальная длина заголовка в сообщении (защита от слишком длинных).
+MAX_TITLE_LENGTH = 200
+
 # Обязательные переменные окружения.
 REQUIRED_ENV_VARS = ("DEEPSEEK_API_KEY", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
 
@@ -91,9 +94,12 @@ RETRYABLE_STATUSES = {403, 429}  # 403/429 и любые 5xx имеет смыс
 
 log = logging.getLogger("sec-bot")
 
-# Регулярка для «мягкого» определения критичности, если LLM слегка
-# отклонился от формата (лишние пробелы внутри скобок и т.п.).
-CRITICALITY_RE = re.compile(r"\[\s*Критичность\s*:\s*([1-5])\s*\]", re.IGNORECASE)
+# Оценка критичности: ловит [Критичность: 5], [Критичность: 5/5],
+# Критичность: 4 — цифры 4-5 считаются критичными.
+CRITICALITY_RE = re.compile(r"(?i)критичность[:\s]*([4-5])")
+
+# Хвост обрезанной HTML-сущности (`&am`, `&#1`) — чтобы не рвать `&amp;`.
+ENTITY_TAIL_RE = re.compile(r"&[#A-Za-z0-9]*$")
 
 # HTML-теги в summary RSS — для промпта их нужно убрать.
 HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -285,13 +291,27 @@ def analyze_news(client: OpenAI, title: str, summary: str) -> str:
 
 def is_critical(analysis: str) -> bool:
     """True, если LLM оценил новость на 4 или 5 (0-day, массовый взлом)."""
-    # Основная проверка — ровно те маркеры, что просили в задании.
-    if "[Критичность: 4]" in analysis or "[Критичность: 5]" in analysis:
-        return True
+    return bool(CRITICALITY_RE.search(analysis))
 
-    # Страховка от мелких отклонений в форматировании.
-    match = CRITICALITY_RE.search(analysis)
-    return bool(match) and int(match.group(1)) >= 4
+
+def truncate_escaped_html(text: str, limit: int) -> str:
+    """Обрезает уже экранированный HTML, не разрывая &-сущности.
+
+    Иначе граница обрезки может попасть в середину `&amp;` / `&#x27;`,
+    и Telegram отвергнет сообщение с ошибкой «can't parse entities».
+    """
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+
+    # Один символ резервируем под многоточие, чтобы не выйти за лимит.
+    cut = text[: limit - 1]
+    tail = ENTITY_TAIL_RE.search(cut)
+    if tail:
+        cut = cut[: tail.start()]
+
+    return cut.rstrip() + "…"
 
 
 def build_message(title: str, link: str, analysis: str, critical: bool) -> str:
@@ -303,21 +323,25 @@ def build_message(title: str, link: str, analysis: str, critical: bool) -> str:
     )
 
     # Экранируем всё, что пришло извне: LLM и RSS могут содержать <, >, &.
-    safe_title = html.escape(title)
-    safe_analysis = html.escape(analysis)
+    safe_title = html.escape(title[:MAX_TITLE_LENGTH])
 
     if link:
         title_line = f'<b><a href="{html.escape(link, quote=True)}">{safe_title}</a></b>'
     else:
         title_line = f"<b>{safe_title}</b>"
 
-    message = f"{header}{title_line}\n\n{safe_analysis}"
+    # Сначала считаем бюджет под текст анализа, затем режем по границе
+    # сущностей — без грубого message[:4086].
+    prefix = f"{header}{title_line}\n\n"
+    remaining = TELEGRAM_MAX_LENGTH - len(prefix)
+    safe_analysis = truncate_escaped_html(html.escape(analysis), remaining)
 
-    # Telegram не примет сообщение длиннее 4096 символов.
-    if len(message) > TELEGRAM_MAX_LENGTH:
-        message = message[: TELEGRAM_MAX_LENGTH - 10] + "\n\n…"
+    return prefix + safe_analysis
 
-    return message
+
+def mask_secret(text: str, secret: str) -> str:
+    """Прячет секрет в строке для лога: str.replace(token, "***")."""
+    return text.replace(secret, "***") if secret else text
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> None:
@@ -330,12 +354,17 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
         "disable_web_page_preview": True,
     }
 
-    response = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+    try:
+        response = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+    except requests.RequestException as exc:
+        # В тексте сетевой ошибки requests может быть URL с токеном — маскируем.
+        raise RuntimeError(mask_secret(str(exc), token)) from exc
 
     if not response.ok:
         # Тело ответа Telegram содержит описание ошибки — полезно в логах.
         raise RuntimeError(
-            f"Telegram API вернул {response.status_code}: {response.text[:500]}"
+            f"Telegram API вернул {response.status_code}: "
+            f"{mask_secret(response.text[:500], token)}"
         )
 
 
@@ -403,6 +432,11 @@ def process_all_feeds(
                     "критично" if critical else "дайджест",
                     item["title"],
                 )
+            except AuthenticationError as exc:
+                # 401 от DeepSeek — ключ невалиден. Прерываем весь цикл,
+                # чтобы не долбить API тем же ключом по каждой статье.
+                log.critical("FATAL: DeepSeek API key is invalid: %s", exc)
+                raise
             except Exception as exc:  # noqa: BLE001
                 log.error("Ошибка обработки «%s»: %s", item["title"], exc)
 
