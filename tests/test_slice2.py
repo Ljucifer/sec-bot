@@ -1,0 +1,212 @@
+"""Тесты Среза 2: дедупликация, анализ, доставка и пайплайн.
+
+Запуск: python -m unittest discover -s tests -v
+"""
+
+import unittest
+
+import app
+
+
+def make_item(index: int, published: str | None = None) -> dict:
+    return {
+        "title": f"News #{index}",
+        "link": f"https://example.com/news/{index}",
+        "summary": f"summary {index}",
+        "published": published or f"2026-11-02T{index % 24:02d}:00:00+00:00",
+        "is_kev": False,
+    }
+
+
+def make_kev(index: int = 0) -> dict:
+    link = f"https://nvd.nist.gov/vuln/detail/CVE-2026-{index}"
+    return {
+        "title": f"CISA KEV: Flaw {index} (CVE-2026-{index})",
+        "name": f"Flaw {index}",
+        "cve_id": f"CVE-2026-{index}",
+        "link": link,
+        "key": link,
+        "summary": "description",
+        "published": "2026-11-01T00:00:00+00:00",
+        "is_kev": True,
+    }
+
+
+class DedupeTests(unittest.TestCase):
+    def test_filters_seen_and_cycle_duplicates(self):
+        items = [make_item(1), make_item(2), make_item(1), make_item(3)]
+        fresh = app.dedupe_items(items, {"https://example.com/news/2"})
+
+        self.assertEqual([item["title"] for item in fresh], ["News #1", "News #3"])
+        for item in fresh:
+            self.assertIn("key", item)
+
+
+class AnalyzeCandidatesTests(unittest.TestCase):
+    def test_budget_and_order(self):
+        items = [
+            make_item(index, published=f"2026-11-01T{index:02d}:00:00+00:00")
+            for index in range(30)
+        ]
+        calls: list[str] = []
+
+        def fake_analyze(client, title, summary):
+            calls.append(title)
+            return "[Критичность: 3] Суть: тест."
+
+        original = app.analyze_news
+        app.analyze_news = fake_analyze
+        try:
+            analyzed, rest = app.analyze_candidates(items, object())
+        finally:
+            app.analyze_news = original
+
+        self.assertEqual(len(analyzed), app.ANALYZE_PER_CYCLE)
+        self.assertEqual(len(rest), 30 - app.ANALYZE_PER_CYCLE)
+        self.assertEqual(calls[0], "News #29")  # самые свежие первыми
+        self.assertEqual(len(calls), app.ANALYZE_PER_CYCLE)
+
+
+class DeliverBatchesTests(unittest.TestCase):
+    def setUp(self):
+        self.original = {
+            "send_telegram_message": app.send_telegram_message,
+            "save_seen_urls": app.save_seen_urls,
+            "DRY_RUN": app.DRY_RUN,
+            "MESSAGE_PAUSE_SECONDS": app.MESSAGE_PAUSE_SECONDS,
+        }
+        app.save_seen_urls = lambda seen: None
+        app.MESSAGE_PAUSE_SECONDS = 0
+
+    def tearDown(self):
+        for name, value in self.original.items():
+            setattr(app, name, value)
+
+    def test_seen_updated_only_after_success(self):
+        app.send_telegram_message = lambda token, chat_id, text: None
+        seen = set()
+
+        messages, delivered = app.deliver_batches(
+            [("ok", [{"key": "k1"}, {"key": "k2"}])], "t", "c", seen
+        )
+
+        self.assertEqual((messages, delivered), (1, 2))
+        self.assertEqual(seen, {"k1", "k2"})
+
+    def test_failed_message_not_recorded(self):
+        def fake_send(token, chat_id, text):
+            if text == "bad":
+                raise RuntimeError("boom")
+
+        app.send_telegram_message = fake_send
+        seen = set()
+
+        messages, delivered = app.deliver_batches(
+            [("bad", [{"key": "k1"}]), ("good", [{"key": "k2"}])], "t", "c", seen
+        )
+
+        self.assertEqual((messages, delivered), (1, 1))
+        self.assertEqual(seen, {"k2"})
+
+    def test_dry_run_sends_nothing(self):
+        app.DRY_RUN = True
+        called = []
+        app.send_telegram_message = lambda *args: called.append(args)
+        seen = set()
+
+        messages, delivered = app.deliver_batches(
+            [("x", [{"key": "k1"}])], "t", "c", seen
+        )
+
+        self.assertEqual(called, [])
+        self.assertEqual(seen, set())
+        self.assertEqual((messages, delivered), (1, 0))
+
+
+class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.original = {
+            "RSS_FEEDS": app.RSS_FEEDS,
+            "fetch_feed_news": app.fetch_feed_news,
+            "fetch_kev_articles": app.fetch_kev_articles,
+            "analyze_news": app.analyze_news,
+            "send_telegram_message": app.send_telegram_message,
+            "save_seen_urls": app.save_seen_urls,
+            "DRY_RUN": app.DRY_RUN,
+            "MESSAGE_PAUSE_SECONDS": app.MESSAGE_PAUSE_SECONDS,
+        }
+        app.RSS_FEEDS = ["https://feed.example/"]
+        app.DRY_RUN = False
+        app.MESSAGE_PAUSE_SECONDS = 0
+        app.save_seen_urls = lambda seen: None
+
+    def tearDown(self):
+        for name, value in self.original.items():
+            setattr(app, name, value)
+
+    def test_no_loss_and_kev_first(self):
+        items = [make_item(index) for index in range(30)]
+
+        def fake_analyze(client, title, summary):
+            number = int(title.split("#")[1])
+            score = 5 if number % 10 == 0 else 3
+            return f"[Критичность: {score}] Суть: тест."
+
+        app.fetch_feed_news = lambda feed_url: items
+        app.fetch_kev_articles = lambda seen: [make_kev(1)]
+        app.analyze_news = fake_analyze
+        sent: list[str] = []
+        app.send_telegram_message = lambda token, chat_id, text: sent.append(text)
+
+        seen: set[str] = set()
+        app.process_all_feeds(object(), "t", "c", seen)
+
+        self.assertEqual(len(seen), 31)  # 30 RSS + 1 KEV
+        self.assertTrue(sent)
+        self.assertIn("CISA KEV", sent[0])
+        self.assertIn("1 новая запись", sent[0])  # плюрализация заголовка
+        alert_text = next(text for text in sent if "Алерты" in text)
+        self.assertIn("2 алерта", alert_text)  # 20 и 10 попали в анализ
+        self.assertTrue(any("🔴" in text for text in sent))
+        self.assertTrue(any("🟡" in text for text in sent))
+
+    def test_dry_run_keeps_history(self):
+        app.DRY_RUN = True
+        app.fetch_feed_news = lambda feed_url: [make_item(1)]
+        app.fetch_kev_articles = lambda seen: []
+        app.analyze_news = lambda client, title, summary: "[Критичность: 2] Суть: т."
+        sent = []
+        app.send_telegram_message = lambda *args: sent.append(args)
+
+        seen: set[str] = set()
+        app.process_all_feeds(object(), "t", "c", seen)
+
+        self.assertEqual(sent, [])
+        self.assertEqual(seen, set())
+
+
+    def test_alert_overflow_goes_to_digest(self):
+        items = [make_item(index) for index in range(30)]
+        app.fetch_feed_news = lambda feed_url: items
+        app.fetch_kev_articles = lambda seen: []
+        # Длинный разбор, чтобы 20 алертов не влезли в 5 сообщений.
+        app.analyze_news = lambda client, title, summary: (
+            "[Критичность: 5] Детали. " * 80
+        )
+        sent: list[str] = []
+        app.send_telegram_message = lambda token, chat_id, text: sent.append(text)
+
+        seen: set[str] = set()
+        app.process_all_feeds(object(), "t", "c", seen)
+
+        alert_messages = [text for text in sent if "🔴 <b>Алерты</b>" in text]
+        digest_messages = [text for text in sent if "🟡 <b>Контекст</b>" in text]
+
+        self.assertLessEqual(len(alert_messages), app.P1_MAX_MESSAGES)
+        self.assertTrue(digest_messages)
+        self.assertIn("🔴", digest_messages[0])  # overflow помечен
+        self.assertEqual(len(seen), 30)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -65,11 +65,23 @@ FETCH_DEPTH = 20
 FETCH_WINDOW_HOURS = 24
 
 # --- Политика доставки (delivery) ---
-# Сколько новостей с каждой ленты реально отправляем (фаза 1 — как раньше).
-SEND_PER_FEED = 2
+# Сколько статей за цикл отправляем в LLM. KEV бюджет не тратит.
+ANALYZE_PER_CYCLE = 20
 
-# Потолок сообщений на цикл — задел под фазу 2, сейчас не используется.
+# Сколько алертов максимум в одном сообщении (или пока не упрёмся в лимит).
+ALERTS_PER_MESSAGE = 5
+
+# Максимум сообщений с алертами за цикл; излишек уходит в дайджест.
+P1_MAX_MESSAGES = 5
+
+# Мягкий потолок сообщений на цикл: только предупреждение в лог.
 MAX_MESSAGES_PER_CYCLE = 12
+
+# Пауза между сообщениями, чтобы не ловить 429 пачкой.
+MESSAGE_PAUSE_SECONDS = 1
+
+# DRY_RUN=1 — собрать и разложить по сообщениям, но не отправлять.
+DRY_RUN = os.getenv("DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
 
 # --- CISA KEV (Known Exploited Vulnerabilities) ---
 CISA_KEV_URL = (
@@ -94,8 +106,11 @@ CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 # Таймаут HTTP-запросов (секунды).
 HTTP_TIMEOUT = 20
 
-# Лимит длины сообщения в Telegram.
+# Лимит длины сообщения в Telegram (UTF-16 code units, как считает Telegram).
 TELEGRAM_MAX_LENGTH = 4096
+
+# Целевой размер одного сообщения при разбивке (запас до лимита Telegram).
+DIGEST_SPLIT_LIMIT = 4000
 
 # Максимальная длина заголовка в сообщении (защита от слишком длинных).
 MAX_TITLE_LENGTH = 200
@@ -134,8 +149,9 @@ TRACKING_PARAMS = {
 log = logging.getLogger("sec-bot")
 
 # Оценка критичности: ловит [Критичность: 5], [Критичность: 5/5],
-# Критичность: 4 — цифры 4-5 считаются критичными.
-CRITICALITY_RE = re.compile(r"(?i)критичность[:\s]*([4-5])")
+# Критичность: 4 и т.п. Захватываем всю шкалу 1-5, чтобы различать
+# «красный» (5) и «жёлтый» (4) уровни.
+CRITICALITY_SCORE_RE = re.compile(r"(?i)критичность[:\s=]*([1-5])(?![0-9])")
 
 # Хвост обрезанной HTML-сущности (`&am`, `&#1`) — чтобы не рвать `&amp;`.
 ENTITY_TAIL_RE = re.compile(r"&[#A-Za-z0-9]*$")
@@ -247,6 +263,19 @@ def clean_text(raw_text: str) -> str:
     return WHITESPACE_RE.sub(" ", html.unescape(without_tags)).strip()
 
 
+def plural(count: int, one: str, few: str, many: str) -> str:
+    """Русская плюрализация: 1 новость / 2–4 новости / 5+ новостей."""
+    remainder = abs(count) % 100
+    if 11 <= remainder <= 14:
+        return many
+    remainder %= 10
+    if remainder == 1:
+        return one
+    if 2 <= remainder <= 4:
+        return few
+    return many
+
+
 def retry_delay_for(response: requests.Response) -> float:
     """Пауза перед повтором: уважаем Retry-After, если сервер его прислал."""
     raw = response.headers.get("Retry-After", "")
@@ -321,9 +350,10 @@ def fetch_feed_news(
         raise ValueError(f"Не удалось разобрать ленту: {feed_url}")
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    candidates = parsed.entries[:depth]
 
     news: list[dict] = []
-    for entry in parsed.entries[:depth]:
+    for entry in candidates:
         published = entry_published(entry)
         if published is not None and published < cutoff:
             continue
@@ -341,6 +371,15 @@ def fetch_feed_news(
                 "is_kev": False,
             }
         )
+
+    # Диагностика: сколько всего записей пришло и сколько попало в окно.
+    log.info(
+        "[RSS] %s: collected %d of %d in %d h",
+        feed_url,
+        len(news),
+        len(candidates),
+        window_hours,
+    )
 
     return news
 
@@ -447,7 +486,10 @@ def fetch_kev_articles(seen_urls: set[str], limit: int = KEV_LIMIT) -> list[dict
         articles.append(
             {
                 "title": f"CISA KEV: {name} ({cve_id})",
+                "name": name,
+                "cve_id": cve_id,
                 "link": link,
+                "key": link,
                 "summary": f"{description} Required action: {action}".strip(),
                 "published": published,
                 "is_kev": True,
@@ -481,24 +523,48 @@ def analyze_news(client: OpenAI, title: str, summary: str) -> str:
     return (response.choices[0].message.content or "").strip()
 
 
+def extract_criticality(analysis: str) -> int | None:
+    """Извлекает оценку критичности 1-5 из ответа LLM (или None)."""
+    match = CRITICALITY_SCORE_RE.search(analysis)
+    return int(match.group(1)) if match else None
+
+
 def is_critical(analysis: str) -> bool:
     """True, если LLM оценил новость на 4 или 5 (0-day, массовый взлом)."""
-    return bool(CRITICALITY_RE.search(analysis))
+    score = extract_criticality(analysis)
+    return score is not None and score >= 4
+
+
+def telegram_length(text: str) -> int:
+    """Длина текста в UTF-16 code units — так считает лимит Telegram.
+
+    Python len() считает code points, а эмодзи в UTF-16 занимают 2 единицы,
+    поэтому для проверки лимита 4096 нужен именно UTF-16.
+    """
+    return len(text.encode("utf-16-le")) // 2
 
 
 def truncate_escaped_html(text: str, limit: int) -> str:
-    """Обрезает уже экранированный HTML, не разрывая &-сущности.
+    """Обрезает уже экранированный HTML под лимит в UTF-16 code units.
 
-    Иначе граница обрезки может попасть в середину `&amp;` / `&#x27;`,
-    и Telegram отвергнет сообщение с ошибкой «can't parse entities».
+    Не разрывает &-сущности (`&amp;` → `&am`) и не выходит за лимит
+    даже на тексте с эмодзи.
     """
-    if len(text) <= limit:
+    if telegram_length(text) <= limit:
         return text
     if limit <= 1:
-        return text[:limit]
+        return ""
 
-    # Один символ резервируем под многоточие, чтобы не выйти за лимит.
-    cut = text[: limit - 1]
+    # Бинарный поиск максимального префикса, который влезает вместе с «…».
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if telegram_length(text[:mid]) <= limit - 1:
+            low = mid
+        else:
+            high = mid - 1
+
+    cut = text[:low]
     tail = ENTITY_TAIL_RE.search(cut)
     if tail:
         cut = cut[: tail.start()]
@@ -506,15 +572,8 @@ def truncate_escaped_html(text: str, limit: int) -> str:
     return cut.rstrip() + "…"
 
 
-def build_message(title: str, link: str, analysis: str, critical: bool) -> str:
-    """Собирает HTML-сообщение для Telegram."""
-    header = (
-        "🚨 <b>КРИТИЧЕСКАЯ НОВОСТЬ</b> 🚨\n\n"
-        if critical
-        else "🛡 <b>Security Дайджест</b>\n\n"
-    )
-
-    # Экранируем всё, что пришло извне: LLM и RSS могут содержать <, >, &.
+def build_alert_block(title: str, link: str, analysis: str) -> str:
+    """Блок алерта: заголовок-ссылка + разбор LLM."""
     safe_title = html.escape(title[:MAX_TITLE_LENGTH])
 
     if link:
@@ -522,13 +581,149 @@ def build_message(title: str, link: str, analysis: str, critical: bool) -> str:
     else:
         title_line = f"<b>{safe_title}</b>"
 
-    # Сначала считаем бюджет под текст анализа, затем режем по границе
-    # сущностей — без грубого message[:4086].
-    prefix = f"{header}{title_line}\n\n"
-    remaining = TELEGRAM_MAX_LENGTH - len(prefix)
-    safe_analysis = truncate_escaped_html(html.escape(analysis), remaining)
+    return f"🚨 {title_line}\n{html.escape(analysis)}"
 
-    return prefix + safe_analysis
+
+def build_digest_line(
+    title: str,
+    link: str,
+    criticality: int | None = None,
+    analyzed: bool = True,
+) -> str:
+    """Строка дайджеста.
+
+    🔴 — алерт 5, не влезший в сообщения-алерты (overflow);
+    ⚠️ — оценка 4 (жёлтый контекст), · — статья не анализировалась
+    (не влезла в лимит LLM), • — остальное.
+    """
+    safe_title = html.escape(title[:MAX_TITLE_LENGTH])
+
+    if link:
+        title_html = f'<a href="{html.escape(link, quote=True)}">{safe_title}</a>'
+    else:
+        title_html = safe_title
+
+    if not analyzed:
+        marker = "·"
+    elif criticality == 5:
+        marker = "🔴"
+    elif criticality == 4:
+        marker = "⚠️"
+    else:
+        marker = "•"
+
+    return f"{marker} {title_html}"
+
+
+def _prepare_header(header: str, limit: int) -> str:
+    """Не даёт заголовку съесть больше четверти лимита сообщения."""
+    max_header = max(limit // 4, 1)
+    if telegram_length(header) > max_header:
+        return truncate_escaped_html(header, max_header)
+    return header
+
+
+def group_blocks(
+    blocks: list[str],
+    header: str = "",
+    limit: int = DIGEST_SPLIT_LIMIT,
+    separator: str = "\n\n",
+    max_items: int | None = None,
+) -> list[list[str]]:
+    """Группирует блоки по сообщениям: по лимиту UTF-16 и/или числу блоков.
+
+    Режет по границам блоков. Одиночный блок больше лимита обрезается
+    через truncate_escaped_html().
+    """
+    if not blocks:
+        return []
+
+    header = _prepare_header(header, limit)
+    sep_len = telegram_length(separator)
+
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_len = telegram_length(header)
+
+    def close() -> None:
+        nonlocal current, current_len
+        if current:
+            groups.append(current)
+            current = []
+            current_len = telegram_length(header)
+
+    for block in blocks:
+        needs_sep = bool(current) or bool(header)
+        add = telegram_length(block) + (sep_len if needs_sep else 0)
+        too_many = max_items is not None and len(current) >= max_items
+
+        if current and (current_len + add > limit or too_many):
+            close()
+            needs_sep = bool(header)
+            add = telegram_length(block) + (sep_len if needs_sep else 0)
+
+        if current_len + add > limit:
+            available = limit - current_len - (sep_len if needs_sep else 0)
+            block = truncate_escaped_html(block, max(available, 1))
+            add = telegram_length(block) + (sep_len if needs_sep else 0)
+
+        current.append(block)
+        current_len += add
+
+    close()
+    return groups
+
+
+def render_group(
+    items: list[dict],
+    render,
+    header: str,
+    separator: str = "\n\n",
+) -> str:
+    """Собирает одно сообщение из группы статей."""
+    body = separator.join(render(item) for item in items)
+    return f"{header}{separator}{body}" if header else body
+
+
+def split_items(
+    items: list[dict],
+    render,
+    header: str = "",
+    limit: int = DIGEST_SPLIT_LIMIT,
+    separator: str = "\n\n",
+    max_items: int | None = None,
+) -> list[list[dict]]:
+    """Делит статьи на группы под сообщения по тем же правилам, что pack_blocks."""
+    if not items:
+        return []
+
+    blocks = [render(item) for item in items]
+    groups = group_blocks(blocks, header, limit, separator, max_items)
+
+    result: list[list[dict]] = []
+    position = 0
+    for group in groups:
+        result.append(items[position : position + len(group)])
+        position += len(group)
+    return result
+
+
+def pack_blocks(
+    blocks: list[str],
+    header: str = "",
+    limit: int = DIGEST_SPLIT_LIMIT,
+    separator: str = "\n\n",
+) -> list[str]:
+    """Раскладывает блоки по сообщениям, не превышая `limit` (UTF-16).
+
+    Обёртка над group_blocks(); используется в тестах и простых случаях.
+    """
+    header = _prepare_header(header, limit)
+    messages: list[str] = []
+    for group in group_blocks(blocks, header, limit, separator):
+        body = separator.join(group)
+        messages.append(f"{header}{separator}{body}" if header else body)
+    return messages
 
 
 def mask_secret(text: str, secret: str) -> str:
@@ -579,27 +774,156 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
         )
 
 
+def dedupe_items(items: list[dict], seen_urls: set[str]) -> list[dict]:
+    """Убирает уже отправленное и дубли внутри одного цикла."""
+    fresh: list[dict] = []
+    seen_in_cycle: set[str] = set()
+
+    for item in items:
+        key = news_key(item)
+        if key in seen_urls or key in seen_in_cycle:
+            continue
+        seen_in_cycle.add(key)
+        fresh.append({**item, "key": key})
+
+    return fresh
+
+
+def analyze_candidates(
+    items: list[dict],
+    client: OpenAI,
+) -> tuple[list[dict], list[dict]]:
+    """Анализирует до ANALYZE_PER_CYCLE самых свежих статей.
+
+    Возвращает (проанализированные, неанализированные). Ошибка одной
+    статьи не прерывает цикл; 401 от DeepSeek — прерывает.
+    """
+    ordered = sorted(items, key=lambda it: it.get("published") or "", reverse=True)
+    analyzed: list[dict] = []
+
+    for item in ordered[:ANALYZE_PER_CYCLE]:
+        try:
+            analysis = analyze_news(client, item["title"], item["summary"])
+        except AuthenticationError as exc:
+            log.critical("FATAL: DeepSeek API key is invalid: %s", exc)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.error("Ошибка обработки «%s»: %s", item["title"], exc)
+            continue
+
+        if not analysis:
+            log.warning("LLM вернул пустой ответ: %s", item["title"])
+            continue
+
+        analyzed.append(
+            {
+                **item,
+                "analysis": analysis,
+                "criticality": extract_criticality(analysis),
+            }
+        )
+
+    rest = [dict(item) for item in ordered[ANALYZE_PER_CYCLE:]]
+    return analyzed, rest
+
+
+def build_kev_line(article: dict) -> str:
+    """Строка KEV-сообщения: CVE-ссылка на NVD + название уязвимости."""
+    cve_id = html.escape(str(article.get("cve_id") or "CVE"))
+    name = html.escape(str(article.get("name") or "")[:150])
+    link = html.escape(str(article.get("link") or ""), quote=True)
+    return f'• <a href="{link}">{cve_id}</a> — {name}'
+
+
+def render_alert(item: dict) -> str:
+    """Рендер алерта для сообщения."""
+    return build_alert_block(item["title"], item["link"], item.get("analysis") or "")
+
+
+def render_digest(item: dict) -> str:
+    """Рендер строки дайджеста."""
+    return build_digest_line(
+        item["title"],
+        item["link"],
+        criticality=item.get("criticality"),
+        analyzed=item.get("analysis") is not None,
+    )
+
+
+def deliver_batches(
+    batches: list[tuple[str, list[dict]]],
+    token: str,
+    chat_id: str,
+    seen_urls: set[str],
+) -> tuple[int, int]:
+    """Отправляет сообщения по очереди, обновляя seen_urls батчем.
+
+    Ссылки попадают в историю только после успешной отправки сообщения.
+    В DRY_RUN ничего не отправляется, история не меняется.
+
+    Возвращает (отправлено сообщений, доставлено новостей).
+    """
+    if len(batches) > MAX_MESSAGES_PER_CYCLE:
+        log.warning(
+            "[budget] %d %s > %d (мягкий лимит, отправляем всё)",
+            len(batches),
+            plural(len(batches), "сообщение", "сообщения", "сообщений"),
+            MAX_MESSAGES_PER_CYCLE,
+        )
+
+    sent_messages = 0
+    delivered_items = 0
+
+    for text, items in batches:
+        if DRY_RUN:
+            log.info(
+                "[DRY_RUN] сообщение (%d %s): %s",
+                len(items),
+                plural(len(items), "новость", "новости", "новостей"),
+                text.replace("\n", " ⏎ ")[:300],
+            )
+            sent_messages += 1
+            continue
+
+        try:
+            send_telegram_message(token, chat_id, text)
+        except Exception as exc:  # noqa: BLE001 — одна пачка не рвёт цикл
+            log.error(
+                "Не удалось отправить сообщение (%d %s): %s",
+                len(items),
+                plural(len(items), "новость", "новости", "новостей"),
+                exc,
+            )
+            continue
+
+        seen_urls.update(item["key"] for item in items)
+        save_seen_urls(seen_urls)
+        sent_messages += 1
+        delivered_items += len(items)
+        time.sleep(MESSAGE_PAUSE_SECONDS)
+
+    return sent_messages, delivered_items
+
+
 def process_all_feeds(
     client: OpenAI,
     token: str,
     chat_id: str,
     seen_urls: set[str],
 ) -> None:
-    """Один полный проход по всем лентам.
+    """Один проход: сбор → дедуп → анализ → доставка пачками.
 
-    `seen_urls` изменяется на месте: после каждой успешной отправки
-    ссылка добавляется туда и сразу сохраняется на диск.
+    Ссылки попадают в `seen_urls` только после успешной отправки
+    сообщения, в котором они были.
     """
-    rss_collected = 0
-
+    # 1. Сбор RSS
+    rss_items: list[dict] = []
     for feed_url in RSS_FEEDS:
         log.info("Читаю ленту: %s", feed_url)
 
-        # Сбой одной ленты не должен ломать весь цикл.
         try:
             news_items = fetch_feed_news(feed_url)
         except requests.RequestException as exc:
-            # 403 после повторной попытки, таймаут, обрыв соединения и т.п.
             log.warning(
                 "[WARN] Источник заблокирован или недоступен: %s (%s)",
                 feed_url,
@@ -610,70 +934,117 @@ def process_all_feeds(
             log.error("Не удалось получить %s: %s", feed_url, exc)
             continue
 
-        rss_collected += len(news_items)
-        to_send = news_items[:SEND_PER_FEED]
+        rss_items.extend(news_items)
 
-        log.info(
-            "[RSS] %s: collected %d, sending %d",
-            feed_url,
-            len(news_items),
-            len(to_send),
-        )
-
-        if not to_send:
-            log.warning("В ленте нет свежих новостей: %s", feed_url)
-            continue
-
-        for item in to_send:
-            key = news_key(item)
-
-            # Дубль уже отправляли — пропускаем, не тратя запросы к LLM.
-            if key in seen_urls:
-                log.info("Пропускаю дубль: %s", item["title"])
-                continue
-
-            # И ошибка по одной новости тоже не должна останавливать остальные.
-            try:
-                analysis = analyze_news(client, item["title"], item["summary"])
-                if not analysis:
-                    log.warning("LLM вернул пустой ответ: %s", item["title"])
-                    continue
-
-                critical = is_critical(analysis)
-                message = build_message(
-                    item["title"], item["link"], analysis, critical
-                )
-                send_telegram_message(token, chat_id, message)
-
-                # Отправка удалась — фиксируем факт сразу, до перехода
-                # к следующей новости, чтобы не потерять его при падении.
-                seen_urls.add(key)
-                save_seen_urls(seen_urls)
-
-                log.info(
-                    "Отправлено (%s): %s",
-                    "критично" if critical else "дайджест",
-                    item["title"],
-                )
-            except AuthenticationError as exc:
-                # 401 от DeepSeek — ключ невалиден. Прерываем весь цикл,
-                # чтобы не долбить API тем же ключом по каждой статье.
-                log.critical("FATAL: DeepSeek API key is invalid: %s", exc)
-                raise
-            except Exception as exc:  # noqa: BLE001
-                log.error("Ошибка обработки «%s»: %s", item["title"], exc)
-
-    # CISA KEV: собираем, но в фазе 1 не отправляем — только логируем.
+    # 2. CISA KEV — отдельный поток, бюджет LLM не тратит.
     kev_articles = fetch_kev_articles(seen_urls)
     for article in kev_articles:
         log.info("[KEV] new: %s", article["title"])
 
-    log.info(
-        "Collected %d articles (%d from RSS, %d from KEV)",
-        rss_collected + len(kev_articles),
-        rss_collected,
-        len(kev_articles),
+    # 3. Дедупликация: уже отправленное + дубли внутри цикла.
+    fresh = dedupe_items(rss_items, seen_urls)
+    duplicates = len(rss_items) - len(fresh)
+
+    # 4. Анализ самых свежих.
+    analyzed, unanalyzed = analyze_candidates(fresh, client)
+
+    # 5. Классификация: 5 — алерты, остальное — контекст.
+    alerts = [item for item in analyzed if item.get("criticality") == 5]
+    digest = [item for item in analyzed if item.get("criticality") != 5] + unanalyzed
+
+    # 6. KEV-сообщения (первыми).
+    kev_header = (
+        f"🆕 <b>CISA KEV</b> — {len(kev_articles)} "
+        f"{plural(len(kev_articles), 'новая запись', 'новые записи', 'новых записей')}"
     )
+    kev_batches = [
+        (render_group(group, build_kev_line, kev_header, "\n"), group)
+        for group in split_items(
+            kev_articles, build_kev_line, kev_header, DIGEST_SPLIT_LIMIT, "\n"
+        )
+    ]
+
+    # 7. Алерты — пачки не больше ALERTS_PER_MESSAGE и 4000 символов.
+    alerts_header = (
+        f"🔴 <b>Алерты</b> — {len(alerts)} "
+        f"{plural(len(alerts), 'алерт', 'алерта', 'алертов')}"
+    )
+    alert_groups = split_items(
+        alerts,
+        render_alert,
+        alerts_header,
+        DIGEST_SPLIT_LIMIT,
+        "\n\n",
+        max_items=ALERTS_PER_MESSAGE,
+    )
+
+    if len(alert_groups) > P1_MAX_MESSAGES:
+        overflow = [
+            item for group in alert_groups[P1_MAX_MESSAGES:] for item in group
+        ]
+        alert_groups = alert_groups[:P1_MAX_MESSAGES]
+        digest.extend(overflow)
+        log.warning(
+            "[alerts] overflow: %d %s → в дайджест (лимит %d %s)",
+            len(overflow),
+            plural(len(overflow), "новость", "новости", "новостей"),
+            P1_MAX_MESSAGES,
+            plural(P1_MAX_MESSAGES, "сообщение", "сообщения", "сообщений"),
+        )
+
+    alert_batches = [
+        (render_group(group, render_alert, alerts_header, "\n\n"), group)
+        for group in alert_groups
+    ]
+
+    # 8. Дайджест: score по убыванию, свежие первыми.
+    digest.sort(
+        key=lambda item: (item.get("criticality") or 0, item.get("published") or ""),
+        reverse=True,
+    )
+    digest_header = (
+        f"🟡 <b>Контекст</b> — {len(digest)} "
+        f"{plural(len(digest), 'новость', 'новости', 'новостей')}"
+    )
+    digest_batches = [
+        (render_group(group, render_digest, digest_header, "\n"), group)
+        for group in split_items(
+            digest, render_digest, digest_header, DIGEST_SPLIT_LIMIT, "\n"
+        )
+    ]
+
+    # 9. Доставка: KEV → алерты → дайджест.
+    batches = kev_batches + alert_batches + digest_batches
+    sent_messages, delivered_items = deliver_batches(
+        batches, token, chat_id, seen_urls
+    )
+
+    # 10. Accounting: ничего не потеряли.
+    alerts_in_messages = sum(len(group) for group in alert_groups)
+    accounted = alerts_in_messages + len(digest) + len(kev_articles)
+    expected = len(analyzed) + len(unanalyzed) + len(kev_articles)
+
+    log.info(
+        "[cycle] collected=%d kev=%d rss_new=%d dupes=%d analyzed=%d "
+        "alerts=%d digest=%d messages=%d delivered=%d dry_run=%s",
+        len(rss_items) + len(kev_articles),
+        len(kev_articles),
+        len(fresh),
+        duplicates,
+        len(analyzed),
+        len(alerts),
+        len(digest),
+        len(batches),
+        delivered_items,
+        DRY_RUN,
+    )
+
+    if accounted != expected:
+        log.warning(
+            "[WARN] accounting mismatch: expected=%d accounted=%d",
+            expected,
+            accounted,
+        )
 
 
 def main() -> None:
@@ -714,14 +1085,15 @@ def main() -> None:
     seen_urls = load_seen_urls()
 
     log.info(
-        "Старт. Лент: %d, сбор: до %d/лента за %d ч, отправка: %d/лента, "
-        "в истории: %d, интервал: %d ч",
+        "Старт. Лент: %d, сбор: до %d/лента за %d ч, анализ: %d/цикл, "
+        "в истории: %d, интервал: %d ч, dry_run=%s",
         len(RSS_FEEDS),
         FETCH_DEPTH,
         FETCH_WINDOW_HOURS,
-        SEND_PER_FEED,
+        ANALYZE_PER_CYCLE,
         len(seen_urls),
         CHECK_INTERVAL_SECONDS // 3600,
+        DRY_RUN,
     )
 
     try:
