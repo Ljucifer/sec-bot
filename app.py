@@ -122,6 +122,9 @@ TELEGRAM_MAX_LENGTH = 4096
 # Целевой размер одного сообщения при разбивке (запас до лимита Telegram).
 DIGEST_SPLIT_LIMIT = 4000
 
+# Разделитель «оригинал · перевод» в строках дайджеста и KEV.
+TRANSLATION_SEPARATOR = " · "
+
 # Максимальная длина заголовка в сообщении (защита от слишком длинных).
 MAX_TITLE_LENGTH = 200
 
@@ -686,7 +689,7 @@ def build_digest_line(
 
     translation = _clean_translation(title_ru or "")
     if translation and translation.casefold() != title.strip().casefold():
-        line += f" — <b>{html.escape(translation[:MAX_TITLE_LENGTH])}</b>"
+        line += f"{TRANSLATION_SEPARATOR}<b>{html.escape(translation[:MAX_TITLE_LENGTH])}</b>"
 
     return line
 
@@ -917,7 +920,7 @@ def build_kev_line(article: dict) -> str:
 
     title_ru = _clean_translation(str(article.get("title_ru") or ""))
     if title_ru:
-        line += f" — <b>{html.escape(title_ru[:150])}</b>"
+        line += f"{TRANSLATION_SEPARATOR}<b>{html.escape(title_ru[:150])}</b>"
 
     desc_ru = _clean_translation(str(article.get("desc_ru") or ""))
     if desc_ru:

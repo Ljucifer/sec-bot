@@ -303,7 +303,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(len(sent), 1)
         self.assertIn("CVE-2026-1 (Flaw 1)", sent[0])
-        self.assertIn("— <b>Перевод названия</b>", sent[0])
+        self.assertIn(" · <b>Перевод названия</b>", sent[0])
         self.assertIn("Краткое описание", sent[0])
 
     def test_kev_translation_fallback(self):
@@ -317,7 +317,7 @@ class PipelineTests(unittest.TestCase):
         app.process_all_feeds(object(), "t", "c", seen)
 
         self.assertIn("CVE-2026-1 (Flaw 1)", sent[0])
-        self.assertNotIn("— <b>", sent[0])
+        self.assertNotIn(" · <b>", sent[0])
 
     def test_alert_overflow_goes_to_digest(self):
         items = [make_item(index) for index in range(30)]

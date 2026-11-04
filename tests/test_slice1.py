@@ -215,13 +215,13 @@ class LocalizationFormattingTests(unittest.TestCase):
             "Original title", "https://e.com", criticality=3, title_ru="Перевод"
         )
         self.assertIn("Original title", line)
-        self.assertIn("— <b>Перевод</b>", line)
+        self.assertIn(" · <b>Перевод</b>", line)
 
     def test_digest_skips_duplicate_translation(self):
         line = app.build_digest_line(
             "Original title", "https://e.com", criticality=3, title_ru="Original title"
         )
-        self.assertNotIn("— <b>", line)
+        self.assertNotIn("<b>", line)
 
     def test_kev_line_with_translation(self):
         line = app.build_kev_line(
@@ -234,7 +234,7 @@ class LocalizationFormattingTests(unittest.TestCase):
             }
         )
         self.assertIn("CVE-2026-1 (Flaw Name)", line)
-        self.assertIn("— <b>Название уязвимости</b>", line)
+        self.assertIn(" · <b>Название уязвимости</b>", line)
         self.assertIn("Краткое описание", line)
 
     def test_no_forbidden_telegram_tags(self):
