@@ -25,7 +25,7 @@ import re
 import sys
 import time
 from collections.abc import Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import feedparser
@@ -452,7 +452,7 @@ def entry_published(entry) -> datetime | None:
         if not parsed:
             continue
         try:
-            return datetime.fromtimestamp(calendar.timegm(parsed), tz=timezone.utc)
+            return datetime.fromtimestamp(calendar.timegm(parsed), tz=UTC)
         except (OverflowError, OSError, ValueError):
             continue
     return None
@@ -477,7 +477,7 @@ def fetch_feed_news(
     if parsed.bozo and not parsed.entries:
         raise ValueError(f"Не удалось разобрать ленту: {feed_url}")
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    cutoff = datetime.now(UTC) - timedelta(hours=window_hours)
     candidates = parsed.entries[:depth]
 
     news: list[dict] = []
@@ -598,7 +598,7 @@ def iso_date(raw: str) -> str | None:
     try:
         return (
             datetime.strptime(str(raw), "%Y-%m-%d")
-            .replace(tzinfo=timezone.utc)
+            .replace(tzinfo=UTC)
             .isoformat()
         )
     except (TypeError, ValueError):
@@ -633,7 +633,7 @@ def fetch_kev_articles(seen_urls: SeenStore, limit: int = KEV_LIMIT) -> list[dic
         reverse=True,
     )
 
-    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=KEV_WINDOW_DAYS)).date()
+    cutoff_date = (datetime.now(UTC) - timedelta(days=KEV_WINDOW_DAYS)).date()
 
     articles: list[dict] = []
     for vuln in ordered:
