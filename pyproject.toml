@@ -1,0 +1,30 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [".venv", "__pycache__", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = [
+    # Пробел перед ':' в срезах (text[:mid]) — конфликтует с форматтерами.
+    "E203",
+    # Длинные строки: включать после прогона ruff format (сейчас 118 строк > 100).
+    "E501",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.lint.per-file-ignores]
+# В тестах лямбды используются как короткие заглушки.
+"tests/*" = ["E731"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["app.py"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+# Строгий режим включаем постепенно: сначала базовые проверки.
+disallow_untyped_defs = false
+check_untyped_defs = false
