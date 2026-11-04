@@ -23,14 +23,17 @@ CISA KEV (Known Exploited Vulnerabilities), просит DeepSeek оценить
    [Критичность: 1-5] (5 — 0-day/массовый взлом, 1 — мнение)
    Суть: одно предложение.
    Детали: 2-3 предложения.
+   TITLE_RU: перевод заголовка на русский
    ```
 
 4. Классифицирует результат: **5 → 🔴 алерты**, **4 → 🟡 контекст** (с `⚠️`),
    остальное и неанализированное — тоже в контекст (с `·`).
 5. Публикует тремя потоками: `🆕 CISA KEV` (отдельно), `🔴 Алерты`
-   (пачками по 5) и `🟡 Контекст` (строками). Каждое сообщение режется
+   (пачками по 5) и `🟡 Контекст` (строками). Оригинальный заголовок
+   остаётся для поиска, перевод идёт следом. Каждое сообщение режется
    по границам новостей до 4000 символов — ничего не выбрасывается.
-6. Забирает CISA KEV — новые записи за последние 7 дней с NVD-ссылками.
+6. Забирает CISA KEV — новые записи за последние 7 дней с NVD-ссылками —
+   и переводит их отдельным запросом (при сбое остаются оригиналы).
 7. Спит 6 часов и повторяет. Любой сбой сети, API или одного источника
    логируется, но не останавливает бота.
 
@@ -52,8 +55,8 @@ CISA KEV (Known Exploited Vulnerabilities), просит DeepSeek оценить
                              ▼
              дедупликация по seen_urls.json (ключ = ссылка)
                              ▼
-          DeepSeek: до 20 самых свежих за цикл (KEV — без LLM)
-                             │  [Критичность: N] + Суть + Детали
+          DeepSeek: до 20 самых свежих (KEV — отдельным запросом)
+                             │  [Критичность: N] + Суть + Детали + TITLE_RU
                              ▼
      классификация: 5 → 🔴, 4 → 🟡⚠️, 1–3 → 🟡, без анализа → 🟡·
                              ▼
@@ -69,8 +72,10 @@ CISA KEV (Known Exploited Vulnerabilities), просит DeepSeek оценить
 | Загрузка RSS | `requests` + `get_with_retry()` | GET с таймаутом 20 с и повтором при 403/429/5xx |
 | Разбор RSS | `feedparser` | до `FETCH_DEPTH` (20) записей за `FETCH_WINDOW_HOURS` (24 ч) |
 | CISA KEV | `requests` → JSON | сортировка по `dateAdded`, окно 7 дней, NVD-ссылки |
+| Перевод KEV | `openai` → DeepSeek | отдельный батч JSON; при ошибке — оригиналы |
 | Дедупликация | `seen_urls.json` | уже отправленное и дубли внутри цикла |
-| Анализ | `openai` SDK → DeepSeek | до `ANALYZE_PER_CYCLE` (20) самых свежих; KEV без LLM |
+| Анализ | `openai` SDK → DeepSeek | до `ANALYZE_PER_CYCLE` (20) самых свежих |
+| Локализация | `extract_title_ru()` | `TITLE_RU` вырезается из разбора; fallback — оригинал |
 | Классификация | `extract_criticality()` | 5 → 🔴, 4 → 🟡⚠️, 1–3 и без анализа → 🟡 |
 | Разбивка | `pack_blocks()` | по границам новостей, ≤ `DIGEST_SPLIT_LIMIT` (4000) UTF-16 |
 | Доставка | `requests` → Telegram API | KEV → алерты → контекст; `seen_urls` батчем после успеха |
@@ -270,6 +275,8 @@ docker compose restart                          # и отправить всё �
   падения в середине цикла.
 - **CISA KEV**: 403/таймаут/битый JSON → `[WARN] CISA KEV fetch failed` и пустой
   список; остальной цикл продолжается. У KEV отдельный таймаут 15 с.
+- **Перевод KEV**: ошибка/таймаут/битый JSON → `[WARN] KEV translation failed`,
+  KEV-сообщение уходит с оригинальными названиями; цикл не прерывается.
 - **Accounting** в конце цикла: `[cycle] collected=… analyzed=… alerts=… digest=…`
   и предупреждение `[WARN] accounting mismatch`, если что-то не сошлось.
 - Логгеры `httpx`/`httpx2` приглушены до `WARNING`, чтобы не сыпать строкой
@@ -298,6 +305,7 @@ docker compose restart                          # и отправить всё �
 | `RETRY_DELAY_SECONDS` | `2` | пауза перед повтором, сек |
 | `TELEGRAM_MAX_LENGTH` | `4096` | лимит длины сообщения |
 | `KEV_TIMEOUT` | `15` | таймаут запроса к CISA KEV |
+| `KEV_TRANSLATE_TIMEOUT` | `20` | таймаут запроса перевода KEV |
 | `KEV_LIMIT` | `10` | сколько новых KEV-записей за прогон |
 | `KEV_WINDOW_DAYS` | `7` | окно свежести KEV |
 | `DRY_RUN` | `0` | `1` — собрать и залогировать, но не отправлять |
@@ -311,6 +319,7 @@ docker compose restart                          # и отправить всё �
 2026-11-02 15:09:26 [INFO] sec-bot: Читаю ленту: https://www.securityweek.com/feed/
 2026-11-02 15:09:27 [INFO] sec-bot: [RSS] https://www.securityweek.com/feed/: collected 3 of 20 in 24 h
 2026-11-02 15:09:29 [INFO] sec-bot: [KEV] new: CISA KEV: Google Brotli Unchecked Return Value Vulnerability (CVE-2026-111497)
+2026-11-02 15:09:29 [INFO] sec-bot: [KEV] translated 10 of 10
 2026-11-02 15:09:29 [INFO] sec-bot: [cycle] collected=25 kev=1 rss_new=24 dupes=0 analyzed=20 alerts=4 digest=20 messages=3 delivered=25 dry_run=False
 2026-11-02 15:09:29 [INFO] sec-bot: Сплю 6 ч до следующей проверки
 ```
@@ -358,6 +367,7 @@ docker compose up -d --force-recreate   # вернуть обычный режи
 | `400 ... chat not found` | неверный `TELEGRAM_CHAT_ID` | получить настоящий ID через `getUpdates` |
 | `403` на конкретной ленте | блокировка CDN/бот-защита | заменить источник или подключить `curl_cffi` |
 | `[WARN] CISA KEV fetch failed` | CISA отдаёт 403 / таймаут / битый JSON | проверить доступность URL из контейнера; бот продолжит без KEV |
+| `[WARN] KEV translation failed` | LLM вернул битый JSON / таймаут | KEV уйдут с оригинальными названиями; проверить ключ и баланс |
 | `[RSS] … collected 0 of 20 in 24 h` | в ленте нет записей за сутки | это норма: лента жива, просто новости старше окна `FETCH_WINDOW_HOURS` |
 | `Не удалось сохранить seen_urls.json` | нет прав на файл | `sudo chown 10001:10001 seen_urls.json` |
 | `[WARN] accounting mismatch` | сбой в отборе/доставке | посмотреть `[cycle]`-строку цикла; сообщить разработчику |

@@ -153,6 +153,109 @@ class PluralTests(unittest.TestCase):
             )
 
 
+class AnalysisParsingTests(unittest.TestCase):
+    def test_extract_title_ru(self):
+        analysis = (
+            "[Критичность: 5]\nСуть: кратко.\nДетали: подробно.\n"
+            "TITLE_RU: Хакеры взломали сервер"
+        )
+        title_ru, cleaned = app.extract_title_ru(analysis)
+
+        self.assertEqual(title_ru, "Хакеры взломали сервер")
+        self.assertNotIn("TITLE_RU", cleaned)
+        self.assertIn("Суть: кратко.", cleaned)
+
+    def test_extract_title_ru_missing(self):
+        title_ru, cleaned = app.extract_title_ru("Суть: без перевода.")
+        self.assertIsNone(title_ru)
+        self.assertEqual(cleaned, "Суть: без перевода.")
+
+    def test_extract_title_ru_strips_quotes_and_bold(self):
+        title_ru, _ = app.extract_title_ru('TITLE_RU: **"Перевод"**')
+        self.assertEqual(title_ru, "Перевод")
+
+    def test_split_analysis_full(self):
+        parts = app.split_analysis("Суть: одно. Детали: два. Ещё детали.")
+        self.assertEqual(parts, ("одно.", "два. Ещё детали."))
+
+    def test_split_analysis_without_details(self):
+        parts = app.split_analysis("Суть: только суть.")
+        self.assertEqual(parts, ("только суть.", ""))
+
+    def test_split_analysis_unknown_format(self):
+        self.assertIsNone(app.split_analysis("просто текст без полей"))
+
+    def test_split_analysis_markdown(self):
+        parts = app.split_analysis("**Суть:** одно.\n**Детали:** два.")
+        self.assertEqual(parts, ("одно.", "два."))
+
+
+class LocalizationFormattingTests(unittest.TestCase):
+    def test_alert_bolds_labels(self):
+        block = app.build_alert_block(
+            "Заголовок", "https://e.com", "Суть: кратко. Детали: подробнее."
+        )
+        self.assertIn("<b>Суть:</b> кратко.", block)
+        self.assertIn("<b>Детали:</b> подробнее.", block)
+
+    def test_alert_fallback_without_labels(self):
+        block = app.build_alert_block("Заголовок", "", "просто текст")
+        self.assertNotIn("<b>Суть:</b>", block)
+        self.assertIn("просто текст", block)
+
+    def test_alert_strips_title_ru_defensively(self):
+        block = app.build_alert_block(
+            "Заголовок", "", "Суть: кратко. Детали: подробно. TITLE_RU: Перевод"
+        )
+        self.assertNotIn("TITLE_RU", block)
+        self.assertIn("<b>Детали:</b> подробно.", block)
+
+    def test_digest_adds_translation(self):
+        line = app.build_digest_line(
+            "Original title", "https://e.com", criticality=3, title_ru="Перевод"
+        )
+        self.assertIn("Original title", line)
+        self.assertIn("— <b>Перевод</b>", line)
+
+    def test_digest_skips_duplicate_translation(self):
+        line = app.build_digest_line(
+            "Original title", "https://e.com", criticality=3, title_ru="Original title"
+        )
+        self.assertNotIn("— <b>", line)
+
+    def test_kev_line_with_translation(self):
+        line = app.build_kev_line(
+            {
+                "cve_id": "CVE-2026-1",
+                "name": "Flaw Name",
+                "link": "https://nvd.nist.gov/vuln/detail/CVE-2026-1",
+                "title_ru": "Название уязвимости",
+                "desc_ru": "Краткое описание",
+            }
+        )
+        self.assertIn("CVE-2026-1 (Flaw Name)", line)
+        self.assertIn("— <b>Название уязвимости</b>", line)
+        self.assertIn("Краткое описание", line)
+
+    def test_no_forbidden_telegram_tags(self):
+        examples = [
+            app.build_alert_block("T", "https://e.com", "Суть: a. Детали: b."),
+            app.build_digest_line("T", "https://e.com", title_ru="Пер"),
+            app.build_kev_line(
+                {
+                    "cve_id": "CVE-2026-1",
+                    "name": "Name",
+                    "link": "https://nvd.nist.gov/vuln/detail/CVE-2026-1",
+                    "title_ru": "Перевод",
+                    "desc_ru": "Описание",
+                }
+            ),
+        ]
+        for text in examples:
+            for tag in ("<ul>", "</ul>", "<li>", "</li>", "<br>"):
+                self.assertNotIn(tag, text.lower())
+
+
 class FixtureTests(unittest.TestCase):
     def _assert_no_loss(self, count):
         blocks = [
