@@ -21,4 +21,9 @@ RUN useradd --create-home --uid 10001 bot \
     && chown -R bot:bot /app
 USER bot
 
+# Метка живости обновляется в конце каждого цикла; 8 ч — с запасом на 6-часовой
+# сон плюс длинный цикл. Healthcheck не перезапускает контейнер, только статус.
+HEALTHCHECK --interval=5m --timeout=10s --start-period=10m --retries=3 \
+    CMD ["python", "-c", "import os,sys,time; p='/tmp/heartbeat'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 8*3600 else 1)"]
+
 CMD ["python", "-u", "app.py"]

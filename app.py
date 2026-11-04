@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -110,6 +111,9 @@ KEV_WINDOW_DAYS = 7
 # же топ логировался бы каждые 6 часов.
 _reported_kev: set[str] = set()
 
+# CVE, встреченные в этом процессе: для «сухой» статистики дублей.
+_seen_cves: set[str] = set()
+
 # Интервал между проверками: 6 часов.
 CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 
@@ -136,6 +140,13 @@ REQUIRED_ENV_VARS = ("DEEPSEEK_API_KEY", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
 # независимо от того, откуда запущен процесс.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SEEN_URLS_FILE = os.path.join(BASE_DIR, "seen_urls.json")
+
+# Максимум записей в истории дедупликации: старые обрезаем при сохранении.
+MAX_SEEN_URLS = 5000
+
+# Файл-метка живости для Docker healthcheck.
+HEARTBEAT_FILE = "/tmp/heartbeat"
+HEARTBEAT_MAX_AGE_SECONDS = 8 * 60 * 60
 
 # Заголовки для запросов к RSS: часть сайтов отдаёт 403 без User-Agent
 # и без заголовков, которые присылает обычный браузер.
@@ -174,6 +185,9 @@ SUMMARY_RE = re.compile(r"(?is)\bсуть\s*[:\-—]\s*")
 DETAILS_RE = re.compile(r"(?is)\bдетали\s*[:\-—]\s*")
 TITLE_RU_RE = re.compile(r"(?is)\bTITLE_RU\s*[:\-—]\s*(.+?)(?:\n|$)")
 
+# CVE-идентификаторы: в заголовках, описаниях и ссылках (в т.ч. на NVD).
+CVE_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+
 # HTML-теги в summary RSS — для промпта их нужно убрать.
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -184,43 +198,98 @@ WHITESPACE_RE = re.compile(r"\s+")
 # ---------------------------------------------------------------------------
 
 
-def load_seen_urls() -> set[str]:
-    """Читает seen_urls.json и возвращает множество уже отправленных ссылок.
+class SeenStore:
+    """История ключей: список для порядка и множество для O(1)-поиска.
 
-    Если файла нет (первый запуск) — возвращает пустое множество.
-    Битый JSON не должен останавливать бота: логируем и стартуем с нуля.
+    Список нужен, чтобы обрезать самые старые записи, множество — чтобы
+    проверка `key in seen` не зависела от размера истории.
+    """
+
+    def __init__(self, keys: Iterable[str] | None = None) -> None:
+        self._order: list[str] = []
+        self._set: set[str] = set()
+        self.update(keys or [])
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._set
+
+    def __len__(self) -> int:
+        return len(self._order)
+
+    @property
+    def order(self) -> list[str]:
+        return self._order
+
+    def add(self, key: str) -> None:
+        if key not in self._set:
+            self._set.add(key)
+            self._order.append(key)
+
+    def update(self, keys: Iterable[str]) -> None:
+        for key in keys:
+            self.add(key)
+
+    def trim(self, limit: int) -> None:
+        """Оставляет последние `limit` записей, синхронизируя множество."""
+        if len(self._order) > limit:
+            self._order = self._order[-limit:]
+            self._set = set(self._order)
+
+
+def _quarantine_seen_file() -> None:
+    """Переименовывает битый файл истории, чтобы не потерять данные для разбора."""
+    corrupt_path = SEEN_URLS_FILE + ".corrupt"
+    try:
+        os.replace(SEEN_URLS_FILE, corrupt_path)
+        log.warning("Битый файл сохранён как %s", corrupt_path)
+    except OSError as exc:
+        log.warning("Не удалось сохранить копию %s: %s", SEEN_URLS_FILE, exc)
+
+
+def load_seen_urls() -> SeenStore:
+    """Читает seen_urls.json и возвращает историю отправленного.
+
+    Если файла нет — возвращает пустую историю. Битый файл откладывается
+    в сторону (.corrupt), не-строки отбрасываются, корректные записи
+    сохраняются, дубликаты схлопываются с сохранением порядка.
     """
     try:
         with open(SEEN_URLS_FILE, encoding="utf-8") as file:
             data = json.load(file)
     except FileNotFoundError:
         log.info("Файл %s не найден — начинаю с пустой историей", SEEN_URLS_FILE)
-        return set()
+        return SeenStore()
     except (json.JSONDecodeError, OSError) as exc:
         log.warning(
             "Не удалось прочитать %s (%s) — начинаю с пустой историей",
             SEEN_URLS_FILE,
             exc,
         )
-        return set()
+        _quarantine_seen_file()
+        return SeenStore()
 
     if not isinstance(data, list):
         log.warning("%s повреждён (ожидался список) — начинаю с нуля", SEEN_URLS_FILE)
-        return set()
+        _quarantine_seen_file()
+        return SeenStore()
 
-    # Отбрасываем всё, что не строка: в файле могли оказаться мусорные данные.
-    return {item for item in data if isinstance(item, str)}
+    valid = [item for item in data if isinstance(item, str)]
+    skipped = len(data) - len(valid)
+    if skipped:
+        log.warning("seen_urls: skipped %d invalid entries", skipped)
+
+    return SeenStore(valid)
 
 
-def save_seen_urls(seen: set[str]) -> None:
-    """Сохраняет историю в seen_urls.json.
+def save_seen_urls(seen: SeenStore) -> None:
+    """Сохраняет историю в seen_urls.json, оставляя MAX_SEEN_URLS записей.
 
-    Пытаемся писать атомарно: во временный файл + os.replace. Но
-    seen_urls.json в Docker — это bind-mount (./seen_urls.json:/app/...),
-    а rename() поверх точки монтирования ядро запрещает (EBUSY).
-    Поэтому при такой ошибке откатываемся на прямую перезапись файла.
+    Пишем атомарно: временный файл + os.replace. В Docker seen_urls.json —
+    bind-mount, а rename() поверх точки монтирования ядро запрещает (EBUSY),
+    поэтому при такой ошибке откатываемся на прямую перезапись файла.
     """
-    payload = json.dumps(sorted(seen), ensure_ascii=False, indent=2) + "\n"
+    seen.trim(MAX_SEEN_URLS)
+    payload = json.dumps(seen.order, ensure_ascii=False, indent=2) + "\n"
     tmp_path = SEEN_URLS_FILE + ".tmp"
 
     try:
@@ -478,6 +547,52 @@ def news_key(item: dict) -> str:
     return link or f"title:{title}"
 
 
+def extract_cves(text: str) -> set[str]:
+    """Достаёт CVE-идентификаторы из текста (в верхнем регистре)."""
+    return {match.upper() for match in CVE_RE.findall(text)}
+
+
+def item_cves(item: dict) -> set[str]:
+    """CVE из заголовка, описания и ссылки статьи."""
+    text = " ".join(
+        [
+            str(item.get("title") or ""),
+            str(item.get("summary") or ""),
+            str(item.get("link") or ""),
+        ]
+    )
+    return extract_cves(text)
+
+
+def cve_stats(rss_items: list[dict], kev_articles: list[dict]) -> tuple[int, int]:
+    """Сухая статистика по CVE: (уникальных в пуле, статей с повторным CVE).
+
+    Поведение не меняет — только считает и пополняет `_seen_cves`, чтобы
+    оценить, сколько новостей склеилось бы при CVE-дедупликации.
+    """
+    known = set(_seen_cves)
+    total: set[str] = set()
+
+    for article in kev_articles:
+        cve_id = str(article.get("cve_id") or "").upper()
+        if cve_id:
+            total.add(cve_id)
+            known.add(cve_id)
+
+    duplicates = 0
+    for item in rss_items:
+        cves = item_cves(item)
+        if not cves:
+            continue
+        total.update(cves)
+        if cves & known:
+            duplicates += 1
+        known.update(cves)
+
+    _seen_cves.update(known)
+    return len(total), duplicates
+
+
 def iso_date(raw: str) -> str | None:
     """Приводит дату CISA (YYYY-MM-DD) к ISO 8601 с UTC; None при ошибке."""
     try:
@@ -490,7 +605,7 @@ def iso_date(raw: str) -> str | None:
         return None
 
 
-def fetch_kev_articles(seen_urls: set[str], limit: int = KEV_LIMIT) -> list[dict]:
+def fetch_kev_articles(seen_urls: SeenStore, limit: int = KEV_LIMIT) -> list[dict]:
     """Забирает новые записи CISA KEV (Known Exploited Vulnerabilities).
 
     Возвращает статьи в общем формате (is_kev=True), отсортированные по
@@ -855,7 +970,7 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
 
 def dedupe_items(
     items: list[dict],
-    seen_urls: set[str],
+    seen_urls: SeenStore,
 ) -> tuple[list[dict], int, int]:
     """Убирает уже отправленное и дубли внутри одного цикла.
 
@@ -1030,11 +1145,23 @@ def translate_kev_articles(
     return _parse_kev_translations(raw)
 
 
+def touch_heartbeat() -> None:
+    """Обновляет метку живости для Docker healthcheck.
+
+    Ошибка записи не должна прерывать цикл: это только диагностика.
+    """
+    try:
+        with open(HEARTBEAT_FILE, "w", encoding="utf-8") as file:
+            file.write(str(int(time.time())))
+    except OSError as exc:
+        log.warning("Не удалось обновить heartbeat: %s", exc)
+
+
 def deliver_batches(
     batches: list[tuple[str, list[dict]]],
     token: str,
     chat_id: str,
-    seen_urls: set[str],
+    seen_urls: SeenStore,
 ) -> tuple[int, int]:
     """Отправляет сообщения по очереди, обновляя seen_urls батчем.
 
@@ -1089,7 +1216,7 @@ def process_all_feeds(
     client: OpenAI,
     token: str,
     chat_id: str,
-    seen_urls: set[str],
+    seen_urls: SeenStore,
 ) -> None:
     """Один проход: сбор → дедуп → анализ → доставка пачками.
 
@@ -1140,6 +1267,9 @@ def process_all_feeds(
 
     # 3. Дедупликация: уже отправленное + дубли внутри цикла.
     fresh, dup_seen, dup_cycle = dedupe_items(rss_items, seen_urls)
+
+    # 3а. Сухая статистика по CVE (поведение не меняет).
+    cve_total, cve_dupes = cve_stats(fresh, kev_articles)
 
     # 4. Анализ самых свежих.
     analyzed, unanalyzed = analyze_candidates(fresh, client)
@@ -1225,7 +1355,8 @@ def process_all_feeds(
     log.info(
         "[cycle] collected=%d kev=%d rss_new=%d window_dropped=%d "
         "dup_seen=%d dup_cycle=%d analyzed=%d ru_missing=%d "
-        "alerts=%d digest=%d messages=%d delivered=%d dry_run=%s",
+        "cve_total=%d cve_dupes=%d alerts=%d digest=%d messages=%d "
+        "delivered=%d seen=%d dry_run=%s",
         len(rss_items) + len(kev_articles),
         len(kev_articles),
         len(fresh),
@@ -1234,10 +1365,13 @@ def process_all_feeds(
         dup_cycle,
         len(analyzed),
         ru_missing,
+        cve_total,
+        cve_dupes,
         len(alerts),
         len(digest),
         len(batches),
         delivered_items,
+        len(seen_urls),
         DRY_RUN,
     )
 
@@ -1309,6 +1443,8 @@ def main() -> None:
                 )
             except Exception:  # noqa: BLE001 — скрипт не должен падать
                 log.exception("Сбой цикла проверки, продолжаю работу")
+            finally:
+                touch_heartbeat()
 
             log.info("Сплю %d ч до следующей проверки", CHECK_INTERVAL_SECONDS // 3600)
             time.sleep(CHECK_INTERVAL_SECONDS)

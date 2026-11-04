@@ -228,12 +228,18 @@ CISA (`/cybersecurity-advisories/all.xml`) убрана: их CDN (Akamai) от�
   «невиденными» и уйдут в следующем цикле. Лучше повторить, чем потерять.
 - **Сохранение после каждого сообщения**, а не в конце цикла — при падении
   процесса уже доставленное не потеряется.
+- **Обрезка истории**: при сохранении остаются последние `MAX_SEEN_URLS`
+  (5000) записей в порядке добавления — файл не растёт бесконечно.
+  При ~40 новых в сутки это ~4 месяца; если старая новость всплывёт позже,
+  она уйдёт повторно.
 - **Атомарная запись**: временный файл + `os.replace()`. В Docker
   `seen_urls.json` — bind-mount, а `rename()` поверх точки монтирования ядро
   запрещает (`EBUSY`), поэтому при такой ошибке код откатывается на прямую
   перезапись файла.
-- **Битый JSON не убивает бота**: файл логируется как повреждённый и работа
-  продолжается с пустой историей (ценой повторной отправки).
+- **Битый файл**: непарсящийся JSON или не-список откладывается в
+  `seen_urls.json.corrupt`, работа продолжается с пустой историей.
+  Не-строки в массиве отбрасываются (`skipped N invalid entries`),
+  корректные записи сохраняются.
 
 Полезные команды:
 
@@ -300,6 +306,7 @@ docker compose restart                          # и отправить всё �
 | `DIGEST_SPLIT_LIMIT` | `4000` | символов на сообщение (UTF-16) |
 | `MAX_MESSAGES_PER_CYCLE` | `12` | мягкий потолок сообщений (только лог) |
 | `MESSAGE_PAUSE_SECONDS` | `1` | пауза между сообщениями |
+| `MAX_SEEN_URLS` | `5000` | сколько последних ссылок хранить в истории |
 | `CHECK_INTERVAL_SECONDS` | `6 * 60 * 60` | период опроса |
 | `HTTP_TIMEOUT` | `20` | таймаут запроса, сек |
 | `FETCH_ATTEMPTS` | `2` | попыток на ленту |
@@ -320,7 +327,7 @@ docker compose restart                          # и отправить всё �
 2026-11-04 13:35:12 [INFO] sec-bot: Читаю ленту: https://www.securityweek.com/feed/
 2026-11-04 13:35:12 [INFO] sec-bot: [RSS] https://www.securityweek.com/feed/: collected 9 of 10 in 24 h
 2026-11-04 13:35:13 [INFO] sec-bot: [RSS] https://thehackernews.com/feeds/posts/default: collected 13 of 20 in 24 h
-2026-11-04 13:35:21 [INFO] sec-bot: [cycle] collected=39 kev=0 rss_new=2 window_dropped=56 dup_seen=37 dup_cycle=0 analyzed=2 ru_missing=0 alerts=0 digest=2 messages=1 delivered=2 dry_run=False
+2026-11-04 13:35:21 [INFO] sec-bot: [cycle] collected=39 kev=0 rss_new=2 window_dropped=56 dup_seen=37 dup_cycle=0 analyzed=2 ru_missing=0 cve_total=2 cve_dupes=0 alerts=0 digest=2 messages=1 delivered=2 seen=142 dry_run=False
 2026-11-04 13:35:21 [INFO] sec-bot: Сплю 6 ч до следующей проверки
 ```
 
@@ -374,6 +381,22 @@ docker compose up -d --force-recreate   # вернуть обычный режи
 
 ---
 
+## Healthcheck
+
+Бот пишет `/tmp/heartbeat` в конце каждого цикла, а `HEALTHCHECK` в Dockerfile
+считает контейнер `healthy`, если метка обновлялась менее 8 часов назад
+(6 ч сна плюс запас на длинный цикл).
+
+```bash
+docker compose ps       # STATUS: Up 5 minutes (healthy)
+```
+
+Важно: `restart: unless-stopped` **не** перезапускает контейнер по `unhealthy` —
+healthcheck только показывает состояние. Для авторестарта нужен внешний
+watchdog (например, `willfarrell/autoheal`).
+
+---
+
 ## Если что-то не так
 
 | Симптом | Причина | Решение |
@@ -387,6 +410,8 @@ docker compose up -d --force-recreate   # вернуть обычный режи
 | `[RSS] … collected 0 of 20 in 24 h` | в ленте нет записей за сутки | это норма: лента жива, просто новости старше окна `FETCH_WINDOW_HOURS` |
 | `Не удалось сохранить seen_urls.json` | нет прав на файл | `sudo chown 10001:10001 seen_urls.json` |
 | `[WARN] accounting mismatch` | сбой в отборе/доставке | посмотреть `[cycle]`-строку цикла; сообщить разработчику |
+| `unhealthy` в `docker compose ps` | цикл не завершался > 8 ч | проверить логи: завис LLM или Telegram |
+| `seen_urls: skipped N invalid entries` | в истории были не-строки | ничего: мусор отброшен, валидные записи сохранены |
 | `[budget] N messages > 12` | новостей больше, чем обычно | мягкий лимит: всё отправлено, просто больше сообщений |
 | Контейнер сразу падает | не заданы переменные | проверить `.env`, затем `docker compose config` |
 
