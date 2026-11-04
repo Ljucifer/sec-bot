@@ -29,7 +29,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import feedparser
 import requests
-from openai import OpenAI, AuthenticationError
+from openai import AuthenticationError, OpenAI
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -393,8 +393,8 @@ def fetch_feed_news(
     feed_url: str,
     depth: int = FETCH_DEPTH,
     window_hours: int = FETCH_WINDOW_HOURS,
-) -> list[dict]:
-    """Возвращает свежие записи одной RSS-ленты (не больше `depth`).
+) -> tuple[list[dict], int]:
+    """Возвращает (свежие записи ленты, сколько записей просмотрено).
 
     Записи старше `window_hours` отбрасываются, если у них есть дата.
     Скачивание — через requests (контроль таймаута), разбор — feedparser.
@@ -440,7 +440,7 @@ def fetch_feed_news(
         window_hours,
     )
 
-    return news
+    return news, len(candidates)
 
 
 def normalize_link(link: str) -> str:
@@ -853,19 +853,31 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
         )
 
 
-def dedupe_items(items: list[dict], seen_urls: set[str]) -> list[dict]:
-    """Убирает уже отправленное и дубли внутри одного цикла."""
+def dedupe_items(
+    items: list[dict],
+    seen_urls: set[str],
+) -> tuple[list[dict], int, int]:
+    """Убирает уже отправленное и дубли внутри одного цикла.
+
+    Возвращает (новые статьи, отброшено по истории, отброшено как дубль цикла).
+    """
     fresh: list[dict] = []
     seen_in_cycle: set[str] = set()
+    dup_seen = 0
+    dup_cycle = 0
 
     for item in items:
         key = news_key(item)
-        if key in seen_urls or key in seen_in_cycle:
+        if key in seen_urls:
+            dup_seen += 1
+            continue
+        if key in seen_in_cycle:
+            dup_cycle += 1
             continue
         seen_in_cycle.add(key)
         fresh.append({**item, "key": key})
 
-    return fresh
+    return fresh, dup_seen, dup_cycle
 
 
 def analyze_candidates(
@@ -1086,11 +1098,13 @@ def process_all_feeds(
     """
     # 1. Сбор RSS
     rss_items: list[dict] = []
+    window_dropped = 0
+
     for feed_url in RSS_FEEDS:
         log.info("Читаю ленту: %s", feed_url)
 
         try:
-            news_items = fetch_feed_news(feed_url)
+            news_items, examined = fetch_feed_news(feed_url)
         except requests.RequestException as exc:
             log.warning(
                 "[WARN] Источник заблокирован или недоступен: %s (%s)",
@@ -1102,6 +1116,7 @@ def process_all_feeds(
             log.error("Не удалось получить %s: %s", feed_url, exc)
             continue
 
+        window_dropped += examined - len(news_items)
         rss_items.extend(news_items)
 
     # 2. CISA KEV — отдельный поток, бюджет LLM не тратит.
@@ -1124,8 +1139,7 @@ def process_all_feeds(
         )
 
     # 3. Дедупликация: уже отправленное + дубли внутри цикла.
-    fresh = dedupe_items(rss_items, seen_urls)
-    duplicates = len(rss_items) - len(fresh)
+    fresh, dup_seen, dup_cycle = dedupe_items(rss_items, seen_urls)
 
     # 4. Анализ самых свежих.
     analyzed, unanalyzed = analyze_candidates(fresh, client)
@@ -1206,14 +1220,20 @@ def process_all_feeds(
     accounted = alerts_in_messages + len(digest) + len(kev_articles)
     expected = len(analyzed) + len(unanalyzed) + len(kev_articles)
 
+    ru_missing = sum(1 for item in analyzed if not item.get("title_ru"))
+
     log.info(
-        "[cycle] collected=%d kev=%d rss_new=%d dupes=%d analyzed=%d "
+        "[cycle] collected=%d kev=%d rss_new=%d window_dropped=%d "
+        "dup_seen=%d dup_cycle=%d analyzed=%d ru_missing=%d "
         "alerts=%d digest=%d messages=%d delivered=%d dry_run=%s",
         len(rss_items) + len(kev_articles),
         len(kev_articles),
         len(fresh),
-        duplicates,
+        window_dropped,
+        dup_seen,
+        dup_cycle,
         len(analyzed),
+        ru_missing,
         len(alerts),
         len(digest),
         len(batches),

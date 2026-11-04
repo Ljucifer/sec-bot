@@ -316,13 +316,12 @@ docker compose restart                          # и отправить всё �
 ## Пример лога
 
 ```
-2026-11-02 15:09:26 [INFO] sec-bot: Старт. Лент: 6, сбор: до 20/лента за 24 ч, анализ: 20/цикл, в истории: 26, интервал: 6 ч, dry_run=False
-2026-11-02 15:09:26 [INFO] sec-bot: Читаю ленту: https://www.securityweek.com/feed/
-2026-11-02 15:09:27 [INFO] sec-bot: [RSS] https://www.securityweek.com/feed/: collected 3 of 20 in 24 h
-2026-11-02 15:09:29 [INFO] sec-bot: [KEV] new: CISA KEV: Google Brotli Unchecked Return Value Vulnerability (CVE-2026-111497)
-2026-11-02 15:09:29 [INFO] sec-bot: [KEV] translated 10 of 10
-2026-11-02 15:09:29 [INFO] sec-bot: [cycle] collected=25 kev=1 rss_new=24 dupes=0 analyzed=20 alerts=4 digest=20 messages=3 delivered=25 dry_run=False
-2026-11-02 15:09:29 [INFO] sec-bot: Сплю 6 ч до следующей проверки
+2026-11-04 13:35:12 [INFO] sec-bot: Старт. Лент: 6, сбор: до 20/лента за 24 ч, анализ: 20/цикл, в истории: 140, интервал: 6 ч, dry_run=False
+2026-11-04 13:35:12 [INFO] sec-bot: Читаю ленту: https://www.securityweek.com/feed/
+2026-11-04 13:35:12 [INFO] sec-bot: [RSS] https://www.securityweek.com/feed/: collected 9 of 10 in 24 h
+2026-11-04 13:35:13 [INFO] sec-bot: [RSS] https://thehackernews.com/feeds/posts/default: collected 13 of 20 in 24 h
+2026-11-04 13:35:21 [INFO] sec-bot: [cycle] collected=39 kev=0 rss_new=2 window_dropped=56 dup_seen=37 dup_cycle=0 analyzed=2 ru_missing=0 alerts=0 digest=2 messages=1 delivered=2 dry_run=False
+2026-11-04 13:35:21 [INFO] sec-bot: Сплю 6 ч до следующей проверки
 ```
 
 ---
@@ -338,6 +337,22 @@ python app.py
 ```
 
 `app.py` читает секреты только из окружения — сам `.env` он не парсит.
+
+---
+
+## Разработка
+
+```bash
+pip install -r requirements.txt ruff mypy types-requests
+
+ruff check .                      # линтер
+mypy app.py                       # проверка типов
+python -m unittest discover -s tests -v
+```
+
+То же самое прогоняется в CI (GitHub Actions) на каждый push и PR:
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). Конфиги — в
+[`pyproject.toml`](pyproject.toml).
 
 ---
 

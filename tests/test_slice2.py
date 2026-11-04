@@ -102,7 +102,9 @@ class KevTranslationTests(unittest.TestCase):
 class DedupeTests(unittest.TestCase):
     def test_filters_seen_and_cycle_duplicates(self):
         items = [make_item(1), make_item(2), make_item(1), make_item(3)]
-        fresh = app.dedupe_items(items, {"https://example.com/news/2"})
+        fresh, dup_seen, dup_cycle = app.dedupe_items(
+            items, {"https://example.com/news/2"}
+        )
 
         self.assertEqual([item["title"] for item in fresh], ["News #1", "News #3"])
         for item in fresh:
@@ -221,7 +223,7 @@ class PipelineTests(unittest.TestCase):
             score = 5 if number % 10 == 0 else 3
             return f"[Критичность: {score}] Суть: тест."
 
-        app.fetch_feed_news = lambda feed_url: items
+        app.fetch_feed_news = lambda feed_url: (items, len(items))
         app.fetch_kev_articles = lambda seen: [make_kev(1)]
         app.analyze_news = fake_analyze
         sent: list[str] = []
@@ -241,7 +243,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_dry_run_keeps_history(self):
         app.DRY_RUN = True
-        app.fetch_feed_news = lambda feed_url: [make_item(1)]
+        app.fetch_feed_news = lambda feed_url: ([make_item(1)], 1)
         app.fetch_kev_articles = lambda seen: []
         app.analyze_news = lambda client, title, summary: "[Критичность: 2] Суть: т."
         sent = []
@@ -254,7 +256,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(seen, set())
 
     def test_digest_uses_title_ru(self):
-        app.fetch_feed_news = lambda feed_url: [make_item(1)]
+        app.fetch_feed_news = lambda feed_url: ([make_item(1)], 1)
         app.fetch_kev_articles = lambda seen: []
         app.analyze_news = lambda c, t, s: (
             "[Критичность: 3] Суть: т. TITLE_RU: Переведённый заголовок"
@@ -270,7 +272,7 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("TITLE_RU", digest)
 
     def test_alert_labels_and_title_ru_stripped(self):
-        app.fetch_feed_news = lambda feed_url: [make_item(1)]
+        app.fetch_feed_news = lambda feed_url: ([make_item(1)], 1)
         app.fetch_kev_articles = lambda seen: []
         app.analyze_news = lambda c, t, s: (
             "[Критичность: 5] Суть: кратко. Детали: подробно. TITLE_RU: Перевод"
@@ -287,7 +289,7 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("TITLE_RU", alert)
 
     def test_kev_translation_applied(self):
-        app.fetch_feed_news = lambda feed_url: []
+        app.fetch_feed_news = lambda feed_url: ([], 0)
         app.fetch_kev_articles = lambda seen: [make_kev(1)]
         app.translate_kev_articles = lambda articles, client: {
             "CVE-2026-1": {
@@ -307,7 +309,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("Краткое описание", sent[0])
 
     def test_kev_translation_fallback(self):
-        app.fetch_feed_news = lambda feed_url: []
+        app.fetch_feed_news = lambda feed_url: ([], 0)
         app.fetch_kev_articles = lambda seen: [make_kev(1)]
         app.translate_kev_articles = lambda articles, client: {}
         sent = []
@@ -321,7 +323,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_alert_overflow_goes_to_digest(self):
         items = [make_item(index) for index in range(30)]
-        app.fetch_feed_news = lambda feed_url: items
+        app.fetch_feed_news = lambda feed_url: (items, len(items))
         app.fetch_kev_articles = lambda seen: []
         # Длинный разбор, чтобы 20 алертов не влезли в 5 сообщений.
         app.analyze_news = lambda client, title, summary: (
