@@ -119,13 +119,18 @@ class BuilderTests(unittest.TestCase):
 
     def test_digest_markers(self):
         self.assertTrue(
-            app.build_digest_line("t", "https://e.com", criticality=4).startswith("⚠️ ")
+            app.build_digest_line("t", "https://e.com", criticality=4).startswith(
+                "• ⚠️ "
+            )
         )
         self.assertTrue(
             app.build_digest_line("t", "https://e.com", criticality=3).startswith("• ")
         )
         self.assertTrue(
-            app.build_digest_line("t", "https://e.com", analyzed=False).startswith("· ")
+            app.build_digest_line("t", "https://e.com", analyzed=False).startswith("• ")
+        )
+        self.assertIn(
+            "🔴", app.build_digest_line("t", "https://e.com", criticality=5)
         )
 
 

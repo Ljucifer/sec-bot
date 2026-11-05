@@ -114,6 +114,21 @@ _reported_kev: set[str] = set()
 # CVE, встреченные в этом процессе: для «сухой» статистики дублей.
 _seen_cves: set[str] = set()
 
+# Сухой детект дублей-историй: совпадение CVE или похожий заголовок (48 ч).
+STORY_TTL_SECONDS = 48 * 60 * 60
+STORY_SIMILARITY = 0.7
+STORY_STOPWORDS = frozenset(
+    {
+        "the", "and", "for", "with", "from", "that", "says", "after",
+        "over", "into", "are", "was", "were", "has", "have", "will",
+        "can", "its", "not", "but", "you", "your", "our", "their",
+        "more", "than", "when", "what", "who", "how", "why", "all",
+        "out", "new", "may", "via", "about", "could", "would", "should",
+        "been", "being", "they", "them",
+    }
+)
+_recent_stories: list[dict] = []
+
 # Интервал между проверками: 6 часов.
 CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 
@@ -599,6 +614,70 @@ def cve_stats(rss_items: list[dict], kev_articles: list[dict]) -> tuple[int, int
     return len(total), duplicates
 
 
+def _story_words(title: str) -> set[str]:
+    """Значимые слова заголовка: нижний регистр, без стоп-слов и коротких."""
+    words = re.findall(r"[a-z0-9]+", title.lower())
+    return {word for word in words if len(word) > 2 and word not in STORY_STOPWORDS}
+
+
+def _prune_stories(now: float) -> None:
+    """Убирает из памяти истории старше STORY_TTL_SECONDS."""
+    global _recent_stories
+    _recent_stories = [
+        story for story in _recent_stories if now - story["ts"] <= STORY_TTL_SECONDS
+    ]
+
+
+def find_story_duplicate(item: dict) -> dict | None:
+    """Ищет уже встречавшуюся историю: по CVE или по похожему заголовку."""
+    now = time.time()
+    _prune_stories(now)
+
+    cves = item_cves(item)
+    words = _story_words(str(item.get("title") or ""))
+
+    for story in _recent_stories:
+        if cves and story["cves"] and (cves & story["cves"]):
+            return story
+
+        if len(words) >= 3 and len(story["words"]) >= 3:
+            union = words | story["words"]
+            if union and len(words & story["words"]) / len(union) >= STORY_SIMILARITY:
+                return story
+
+    return None
+
+
+def remember_story(item: dict) -> None:
+    """Запоминает историю для сравнения в следующих циклах."""
+    _recent_stories.append(
+        {
+            "ts": time.time(),
+            "cves": item_cves(item),
+            "words": _story_words(str(item.get("title") or "")),
+            "title": str(item.get("title") or ""),
+        }
+    )
+
+
+def story_dupes_stats(items: list[dict]) -> int:
+    """Сухой детект дублей: считает и логирует пары, но ничего не фильтрует."""
+    duplicates = 0
+
+    for item in items:
+        seen = find_story_duplicate(item)
+        if seen is not None:
+            duplicates += 1
+            log.info(
+                "[dedup] would skip: %s ≈ %s",
+                item.get("title"),
+                seen["title"],
+            )
+        remember_story(item)
+
+    return duplicates
+
+
 def iso_date(raw: str) -> str | None:
     """Приводит дату CISA (YYYY-MM-DD) к ISO 8601 с UTC; None при ошибке."""
     try:
@@ -804,15 +883,15 @@ def build_digest_line(
         title_html = safe_title
 
     if not analyzed:
-        marker = "·"
+        prefix = "• "
     elif criticality == 5:
-        marker = "🔴"
+        prefix = "• 🔴 "
     elif criticality == 4:
-        marker = "⚠️"
+        prefix = "• ⚠️ "
     else:
-        marker = "•"
+        prefix = "• "
 
-    line = f"{marker} {title_html}"
+    line = f"{prefix}{title_html}"
 
     translation = _clean_translation(title_ru or "")
     if translation and translation.casefold() != title.strip().casefold():
@@ -1294,8 +1373,9 @@ def process_all_feeds(
     # 3. Дедупликация: уже отправленное + дубли внутри цикла.
     fresh, dup_seen, dup_cycle = dedupe_items(rss_items, seen_urls)
 
-    # 3а. Сухая статистика по CVE (поведение не меняет).
+    # 3а. Сухая статистика по CVE и дублям-историям (поведение не меняет).
     cve_total, cve_dupes = cve_stats(fresh, kev_articles)
+    story_dupes = story_dupes_stats(fresh)
 
     # 4. Анализ самых свежих.
     analyzed, unanalyzed = analyze_candidates(fresh, client)
@@ -1381,7 +1461,7 @@ def process_all_feeds(
     log.info(
         "[cycle] collected=%d kev=%d rss_new=%d window_dropped=%d "
         "dup_seen=%d dup_cycle=%d analyzed=%d ru_missing=%d "
-        "cve_total=%d cve_dupes=%d alerts=%d digest=%d messages=%d "
+        "cve_total=%d cve_dupes=%d story_dupes=%d alerts=%d digest=%d messages=%d "
         "delivered=%d seen=%d dry_run=%s",
         len(rss_items) + len(kev_articles),
         len(kev_articles),
@@ -1393,6 +1473,7 @@ def process_all_feeds(
         ru_missing,
         cve_total,
         cve_dupes,
+        story_dupes,
         len(alerts),
         len(digest),
         len(batches),

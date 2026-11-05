@@ -167,5 +167,59 @@ class CveStatsTests(unittest.TestCase):
         self.assertEqual(app.cve_stats([item], []), (1, 1))
 
 
+class StoryDedupTests(unittest.TestCase):
+    def setUp(self):
+        self._original = app._recent_stories
+        app._recent_stories = []
+
+    def tearDown(self):
+        app._recent_stories = self._original
+
+    @staticmethod
+    def _item(title, link="https://e.com/1"):
+        return {"title": title, "link": link, "summary": ""}
+
+    def test_same_cve_is_duplicate(self):
+        app.story_dupes_stats([self._item("A CVE-2026-1111")])
+
+        self.assertEqual(app.story_dupes_stats([self._item("B CVE-2026-1111")]), 1)
+
+    def test_similar_titles_are_duplicate(self):
+        app.story_dupes_stats(
+            [self._item("Zyxel GS1900 patch fails to block zero-day exploit")]
+        )
+        duplicate = app.story_dupes_stats(
+            [self._item("Zyxel GS1900 patch fails to block zero-day attacks")]
+        )
+
+        self.assertEqual(duplicate, 1)
+
+    def test_same_template_different_vendor_not_duplicate(self):
+        app.story_dupes_stats([self._item("Cisco patch fails to block exploit")])
+        duplicate = app.story_dupes_stats(
+            [self._item("Zyxel patch fails to block exploit")]
+        )
+
+        self.assertEqual(duplicate, 0)
+
+    def test_different_stories_not_duplicate(self):
+        app.story_dupes_stats([self._item("Apple fixes Safari bug")])
+
+        self.assertEqual(
+            app.story_dupes_stats([self._item("Cisco patches firewall")]), 0
+        )
+
+    def test_ttl_expires(self):
+        with mock.patch.object(app.time, "time", return_value=1000.0):
+            app.remember_story(self._item("A CVE-2026-1111"))
+
+        with mock.patch.object(
+            app.time,
+            "time",
+            return_value=1000.0 + app.STORY_TTL_SECONDS + 1,
+        ):
+            self.assertIsNone(app.find_story_duplicate(self._item("B CVE-2026-1111")))
+
+
 if __name__ == "__main__":
     unittest.main()
