@@ -132,6 +132,11 @@ TRANSLATION_SEPARATOR = " · "
 # Максимальная длина заголовка в сообщении (защита от слишком длинных).
 MAX_TITLE_LENGTH = 200
 
+# Ограничения строк KEV: название, перевод и описание режем по границе слова.
+KEV_NAME_LIMIT = 150
+KEV_TITLE_LIMIT = 150
+KEV_DESC_LIMIT = 300
+
 # Обязательные переменные окружения.
 REQUIRED_ENV_VARS = ("DEEPSEEK_API_KEY", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
 
@@ -365,7 +370,8 @@ def plural(count: int, one: str, few: str, many: str) -> str:
 
 def _clean_translation(raw: str) -> str:
     """Приводит перевод к одной строке без кавычек и markdown-обвязки."""
-    text = WHITESPACE_RE.sub(" ", raw or "").strip()
+    text = (raw or "").replace("\ufffd", "")
+    text = WHITESPACE_RE.sub(" ", text).strip()
     return text.strip(" \t\"'«»“”*`~")
 
 
@@ -718,11 +724,12 @@ def telegram_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def truncate_escaped_html(text: str, limit: int) -> str:
+def truncate_escaped_html(text: str, limit: int, at_word: bool = False) -> str:
     """Обрезает уже экранированный HTML под лимит в UTF-16 code units.
 
     Не разрывает &-сущности (`&amp;` → `&am`) и не выходит за лимит
-    даже на тексте с эмодзи.
+    даже на тексте с эмодзи. При `at_word=True` не рвёт слово пополам
+    и добавляет многоточие.
     """
     if telegram_length(text) <= limit:
         return text
@@ -742,6 +749,11 @@ def truncate_escaped_html(text: str, limit: int) -> str:
     tail = ENTITY_TAIL_RE.search(cut)
     if tail:
         cut = cut[: tail.start()]
+
+    if at_word and cut and low < len(text) and not text[low].isspace():
+        space = cut.rfind(" ")
+        if space > 0:
+            cut = cut[:space]
 
     return cut.rstrip() + "…"
 
@@ -1040,18 +1052,32 @@ def analyze_candidates(
 def build_kev_line(article: dict) -> str:
     """Строка KEV-сообщения: CVE, оригинальное название и перевод (если есть)."""
     cve_id = html.escape(str(article.get("cve_id") or "CVE"))
-    name = html.escape(str(article.get("name") or "")[:150])
+    name = truncate_escaped_html(
+        html.escape(str(article.get("name") or "")),
+        KEV_NAME_LIMIT,
+        at_word=True,
+    )
     link = html.escape(str(article.get("link") or ""), quote=True)
 
     line = f'• 🆕 <a href="{link}">{cve_id} ({name})</a>'
 
     title_ru = _clean_translation(str(article.get("title_ru") or ""))
     if title_ru:
-        line += f"{TRANSLATION_SEPARATOR}<b>{html.escape(title_ru[:150])}</b>"
+        title_html = truncate_escaped_html(
+            html.escape(title_ru),
+            KEV_TITLE_LIMIT,
+            at_word=True,
+        )
+        line += f"{TRANSLATION_SEPARATOR}<b>{title_html}</b>"
 
     desc_ru = _clean_translation(str(article.get("desc_ru") or ""))
     if desc_ru:
-        line += f"\n{html.escape(desc_ru[:200])}"
+        desc_html = truncate_escaped_html(
+            html.escape(desc_ru),
+            KEV_DESC_LIMIT,
+            at_word=True,
+        )
+        line += f"\n{desc_html}"
 
     return line
 

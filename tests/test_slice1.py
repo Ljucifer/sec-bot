@@ -301,5 +301,68 @@ class FixtureTests(unittest.TestCase):
             self.assertIn(block, joined)
 
 
+class KevTruncationTests(unittest.TestCase):
+    def test_truncate_at_word_boundary(self):
+        text = "слово " * 40
+        out = app.truncate_escaped_html(text, 40, at_word=True)
+
+        self.assertTrue(out.endswith("…"))
+        self.assertLessEqual(app.telegram_length(out), 40)
+        body = out[:-1]
+        self.assertEqual(body, body.rstrip())
+        # Граница не должна приходиться на середину слова.
+        self.assertTrue(text[len(body)].isspace())
+
+    def test_long_desc_ends_with_ellipsis(self):
+        line = app.build_kev_line(
+            {
+                "cve_id": "CVE-2024-27834",
+                "name": "Apple Multiple Products Improper Authentication Vulnerability",
+                "link": "https://nvd.nist.gov/vuln/detail/CVE-2024-27834",
+                "title_ru": "Уязвимость неправильной аутентификации в продуктах Apple",
+                "desc_ru": "Очень длинное описание уязвимости " * 40,
+            }
+        )
+
+        desc = line.split("\n", 1)[1]
+        self.assertTrue(desc.endswith("…"))
+        self.assertLessEqual(app.telegram_length(desc), app.KEV_DESC_LIMIT)
+
+    def test_short_desc_untouched(self):
+        line = app.build_kev_line(
+            {
+                "cve_id": "CVE-2024-1",
+                "name": "Name",
+                "link": "https://nvd.nist.gov/vuln/detail/CVE-2024-1",
+                "desc_ru": "Коротко.",
+            }
+        )
+
+        self.assertTrue(line.endswith("\nКоротко."))
+
+    def test_long_name_truncated_with_ellipsis(self):
+        line = app.build_kev_line(
+            {
+                "cve_id": "CVE-2024-1",
+                "name": "Очень длинное название уязвимости " * 20,
+                "link": "https://nvd.nist.gov/vuln/detail/CVE-2024-1",
+            }
+        )
+
+        self.assertIn("…", line)
+
+    def test_replacement_chars_removed(self):
+        line = app.build_kev_line(
+            {
+                "cve_id": "CVE-2024-1",
+                "name": "Name",
+                "link": "https://nvd.nist.gov/vuln/detail/CVE-2024-1",
+                "desc_ru": "Текст\ufffd\ufffd уязвимости",
+            }
+        )
+
+        self.assertNotIn("\ufffd", line)
+
+
 if __name__ == "__main__":
     unittest.main()
