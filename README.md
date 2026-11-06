@@ -241,8 +241,9 @@ CISA (`/cybersecurity-advisories/all.xml`) убрана: их CDN (Akamai) от�
   Не-строки в массиве отбрасываются (`skipped N invalid entries`),
   корректные записи сохраняются.
 - **Дубли-истории** (одна новость на разных сайтах) пока только детектируются:
-  `story_dupes` в `[cycle]` и `[dedup] would skip: A ≈ B` в логе. Отправку
-  это не меняет — сначала собираем статистику, потом включим реальный пропуск.
+  `story_dupes` и `story_max` в `[cycle]`; в лог пишутся пары
+  `[dedup] would skip: A ≈ B` и «почти совпадения» `[dedup] near miss (0.62)`.
+  Отправку это не меняет — сначала собираем статистику, потом включим пропуск.
 
 Полезные команды:
 
@@ -322,6 +323,7 @@ docker compose restart                          # и отправить всё �
 | `KEV_DESC_LIMIT` | `300` | обрезка описания KEV (по границе слова, с «…») |
 | `STORY_TTL_SECONDS` | `48 * 60 * 60` | окно поиска дублей-историй |
 | `STORY_SIMILARITY` | `0.7` | порог схожести заголовков (Jaccard) |
+| `STORY_NEAR_MISS` | `0.4` | порог лога «почти совпадение» |
 | `DRY_RUN` | `0` | `1` — собрать и залогировать, но не отправлять |
 
 ---
@@ -333,7 +335,7 @@ docker compose restart                          # и отправить всё �
 2026-11-04 13:35:12 [INFO] sec-bot: Читаю ленту: https://www.securityweek.com/feed/
 2026-11-04 13:35:12 [INFO] sec-bot: [RSS] https://www.securityweek.com/feed/: collected 9 of 10 in 24 h
 2026-11-04 13:35:13 [INFO] sec-bot: [RSS] https://thehackernews.com/feeds/posts/default: collected 13 of 20 in 24 h
-2026-11-04 13:35:21 [INFO] sec-bot: [cycle] collected=39 kev=0 rss_new=2 window_dropped=56 dup_seen=37 dup_cycle=0 analyzed=2 ru_missing=0 cve_total=2 cve_dupes=0 story_dupes=0 alerts=0 digest=2 messages=1 delivered=2 seen=142 dry_run=False
+2026-11-04 13:35:21 [INFO] sec-bot: [cycle] collected=39 kev=0 rss_new=2 window_dropped=56 dup_seen=37 dup_cycle=0 analyzed=2 ru_missing=0 cve_total=2 cve_dupes=0 story_dupes=0 story_max=0.00 alerts=0 digest=2 messages=1 delivered=2 seen=142 dry_run=False
 2026-11-04 13:35:21 [INFO] sec-bot: Сплю 6 ч до следующей проверки
 ```
 

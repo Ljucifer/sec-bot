@@ -181,33 +181,63 @@ class StoryDedupTests(unittest.TestCase):
 
     def test_same_cve_is_duplicate(self):
         app.story_dupes_stats([self._item("A CVE-2026-1111")])
+        duplicates, score = app.story_dupes_stats([self._item("B CVE-2026-1111")])
 
-        self.assertEqual(app.story_dupes_stats([self._item("B CVE-2026-1111")]), 1)
+        self.assertEqual(duplicates, 1)
+        self.assertEqual(score, 1.0)
 
     def test_similar_titles_are_duplicate(self):
         app.story_dupes_stats(
             [self._item("Zyxel GS1900 patch fails to block zero-day exploit")]
         )
-        duplicate = app.story_dupes_stats(
+        duplicates, score = app.story_dupes_stats(
             [self._item("Zyxel GS1900 patch fails to block zero-day attacks")]
         )
 
-        self.assertEqual(duplicate, 1)
+        self.assertEqual(duplicates, 1)
+        self.assertGreaterEqual(score, app.STORY_SIMILARITY)
 
     def test_same_template_different_vendor_not_duplicate(self):
         app.story_dupes_stats([self._item("Cisco patch fails to block exploit")])
-        duplicate = app.story_dupes_stats(
+        duplicates, score = app.story_dupes_stats(
             [self._item("Zyxel patch fails to block exploit")]
         )
 
-        self.assertEqual(duplicate, 0)
+        self.assertEqual(duplicates, 0)
+        self.assertLess(score, app.STORY_SIMILARITY)
 
     def test_different_stories_not_duplicate(self):
         app.story_dupes_stats([self._item("Apple fixes Safari bug")])
-
-        self.assertEqual(
-            app.story_dupes_stats([self._item("Cisco patches firewall")]), 0
+        duplicates, score = app.story_dupes_stats(
+            [self._item("Cisco patches firewall")]
         )
+
+        self.assertEqual(duplicates, 0)
+        self.assertLess(score, app.STORY_NEAR_MISS)
+
+    def test_near_miss_reported_below_threshold(self):
+        app.story_dupes_stats(
+            [self._item("Zyxel GS1900 patch fails to block zero-day exploit")]
+        )
+        duplicates, score = app.story_dupes_stats(
+            [self._item("Zyxel patches GS1900 zero-day exploit")]
+        )
+
+        self.assertEqual(duplicates, 0)
+        self.assertGreaterEqual(score, app.STORY_NEAR_MISS)
+        self.assertLess(score, app.STORY_SIMILARITY)
+
+    def test_best_match_returns_highest_score(self):
+        app._recent_stories = []
+        app.remember_story(self._item("Apple fixes Safari bug"))
+        app.remember_story(self._item("Zyxel GS1900 zero-day exploit"))
+
+        story, score = app.best_story_match(
+            self._item("Zyxel GS1900 zero-day exploit details")
+        )
+
+        self.assertIsNotNone(story)
+        self.assertGreaterEqual(score, app.STORY_NEAR_MISS)
 
     def test_ttl_expires(self):
         with mock.patch.object(app.time, "time", return_value=1000.0):

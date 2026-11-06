@@ -117,6 +117,8 @@ _seen_cves: set[str] = set()
 # Сухой детект дублей-историй: совпадение CVE или похожий заголовок (48 ч).
 STORY_TTL_SECONDS = 48 * 60 * 60
 STORY_SIMILARITY = 0.7
+# Ниже порога, но выше этого значения — логируем «почти совпадение» для калибровки.
+STORY_NEAR_MISS = 0.4
 STORY_STOPWORDS = frozenset(
     {
         "the", "and", "for", "with", "from", "that", "says", "after",
@@ -628,24 +630,41 @@ def _prune_stories(now: float) -> None:
     ]
 
 
-def find_story_duplicate(item: dict) -> dict | None:
-    """Ищет уже встречавшуюся историю: по CVE или по похожему заголовку."""
+def _story_similarity(words: set[str], other: set[str]) -> float:
+    """Сходство заголовков по Jaccard; короткие наборы не сравниваем."""
+    if len(words) < 3 or len(other) < 3:
+        return 0.0
+    union = words | other
+    return len(words & other) / len(union) if union else 0.0
+
+
+def best_story_match(item: dict) -> tuple[dict | None, float]:
+    """Лучшее совпадение среди недавних историй: (история, сходство 0..1)."""
     now = time.time()
     _prune_stories(now)
 
     cves = item_cves(item)
     words = _story_words(str(item.get("title") or ""))
 
+    best: dict | None = None
+    best_score = 0.0
+
     for story in _recent_stories:
         if cves and story["cves"] and (cves & story["cves"]):
-            return story
+            return story, 1.0
 
-        if len(words) >= 3 and len(story["words"]) >= 3:
-            union = words | story["words"]
-            if union and len(words & story["words"]) / len(union) >= STORY_SIMILARITY:
-                return story
+        score = _story_similarity(words, story["words"])
+        if score > best_score:
+            best = story
+            best_score = score
 
-    return None
+    return best, best_score
+
+
+def find_story_duplicate(item: dict) -> dict | None:
+    """История, которую стоит считать дублем (порог STORY_SIMILARITY)."""
+    story, score = best_story_match(item)
+    return story if score >= STORY_SIMILARITY else None
 
 
 def remember_story(item: dict) -> None:
@@ -660,22 +679,33 @@ def remember_story(item: dict) -> None:
     )
 
 
-def story_dupes_stats(items: list[dict]) -> int:
-    """Сухой детект дублей: считает и логирует пары, но ничего не фильтрует."""
+def story_dupes_stats(items: list[dict]) -> tuple[int, float]:
+    """Сухой детект: (дублей, максимальное сходство), без фильтрации."""
     duplicates = 0
+    max_score = 0.0
 
     for item in items:
-        seen = find_story_duplicate(item)
-        if seen is not None:
+        story, score = best_story_match(item)
+        max_score = max(max_score, score)
+
+        if story is not None and score >= STORY_SIMILARITY:
             duplicates += 1
             log.info(
                 "[dedup] would skip: %s ≈ %s",
                 item.get("title"),
-                seen["title"],
+                story["title"],
             )
+        elif story is not None and score >= STORY_NEAR_MISS:
+            log.info(
+                "[dedup] near miss (%.2f): %s ≈ %s",
+                score,
+                item.get("title"),
+                story["title"],
+            )
+
         remember_story(item)
 
-    return duplicates
+    return duplicates, max_score
 
 
 def iso_date(raw: str) -> str | None:
@@ -1375,7 +1405,7 @@ def process_all_feeds(
 
     # 3а. Сухая статистика по CVE и дублям-историям (поведение не меняет).
     cve_total, cve_dupes = cve_stats(fresh, kev_articles)
-    story_dupes = story_dupes_stats(fresh)
+    story_dupes, story_max = story_dupes_stats(fresh)
 
     # 4. Анализ самых свежих.
     analyzed, unanalyzed = analyze_candidates(fresh, client)
@@ -1461,7 +1491,8 @@ def process_all_feeds(
     log.info(
         "[cycle] collected=%d kev=%d rss_new=%d window_dropped=%d "
         "dup_seen=%d dup_cycle=%d analyzed=%d ru_missing=%d "
-        "cve_total=%d cve_dupes=%d story_dupes=%d alerts=%d digest=%d messages=%d "
+        "cve_total=%d cve_dupes=%d story_dupes=%d story_max=%.2f "
+        "alerts=%d digest=%d messages=%d "
         "delivered=%d seen=%d dry_run=%s",
         len(rss_items) + len(kev_articles),
         len(kev_articles),
@@ -1474,6 +1505,7 @@ def process_all_feeds(
         cve_total,
         cve_dupes,
         story_dupes,
+        story_max,
         len(alerts),
         len(digest),
         len(batches),
