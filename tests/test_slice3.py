@@ -239,6 +239,68 @@ class StoryDedupTests(unittest.TestCase):
         self.assertIsNotNone(story)
         self.assertGreaterEqual(score, app.STORY_NEAR_MISS)
 
+    def test_zdi_advisories_not_duplicate(self):
+        app.story_dupes_stats(
+            [
+                self._item(
+                    "ZDI-26-884: OriginLab Origin Viewer OGWU File Parsing "
+                    "Out-Of-Bounds Write Remote Code Execution Vulnerability"
+                )
+            ]
+        )
+        duplicates, score = app.story_dupes_stats(
+            [
+                self._item(
+                    "ZDI-26-886: OriginLab Origin Viewer OPJU File Parsing "
+                    "Out-Of-Bounds Write Remote Code Execution Vulnerability"
+                )
+            ]
+        )
+
+        self.assertEqual(duplicates, 0)
+        self.assertEqual(score, 0.0)
+
+    def test_different_cves_not_duplicate(self):
+        app.story_dupes_stats(
+            [self._item("Vendor X patch fixes CVE-2026-1111 in product")]
+        )
+        duplicates, score = app.story_dupes_stats(
+            [self._item("Vendor X patch fixes CVE-2026-2222 in product")]
+        )
+
+        self.assertEqual(duplicates, 0)
+        self.assertEqual(score, 0.0)
+
+    def test_kev_covered_by_news(self):
+        kev = [
+            {
+                "cve_id": "CVE-2026-19868",
+                "title": "CISA KEV: SonicWall SonicOS SSLVPN ... (CVE-2026-19868)",
+                "link": "https://nvd.nist.gov/vuln/detail/CVE-2026-19868",
+            }
+        ]
+        news = [
+            {
+                "title": "SonicWall warns of new SSL-VPN MFA bypass flaw",
+                "summary": "The vulnerability, tracked as CVE-2026-19868, ...",
+                "link": "https://www.bleepingcomputer.com/news/security/sonicwall/",
+            }
+        ]
+
+        self.assertEqual(app.kev_covered_by_news(kev, news), 1)
+
+    def test_kev_not_covered(self):
+        kev = [{"cve_id": "CVE-2026-19868", "title": "x", "link": "y"}]
+        news = [
+            {
+                "title": "Unrelated story",
+                "summary": "No identifiers here",
+                "link": "https://example.com/1",
+            }
+        ]
+
+        self.assertEqual(app.kev_covered_by_news(kev, news), 0)
+
     def test_ttl_expires(self):
         with mock.patch.object(app.time, "time", return_value=1000.0):
             app.remember_story(self._item("A CVE-2026-1111"))
