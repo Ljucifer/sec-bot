@@ -3,11 +3,29 @@
 ![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)
 ![Docker](https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white)
 ![DeepSeek](https://img.shields.io/badge/LLM-DeepSeek-4D6BFE)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
 Бот раз в 6 часов собирает новости по кибербезопасности из RSS-лент и из каталога
 CISA KEV (Known Exploited Vulnerabilities), просит DeepSeek оценить критичность
 каждой новости и присылает разбор в Telegram. Критичные новости (0-day, массовые
 взломы) помечаются отдельным заголовком, остальные идут как дайджест.
+
+> **English TL;DR** — self-hosted Telegram bot: reads security RSS feeds and
+> CISA KEV, scores each story with DeepSeek (1–5), translates titles into Russian,
+> and posts a compact digest. Personal project, not a SOC platform.
+
+---
+
+## Статус
+
+Личный проект для собственного мониторинга, а не продукт и не SOC-платформа:
+один Telegram-канал, конфиг в константах, без веб-интерфейса и мультипользовательности.
+
+- **Дедупликация** работает в сухом режиме: `story_dupes`, `story_max` и
+  `kev_covered` собирают статистику, но ничего не отбрасывают.
+- **Состояние в памяти** (`_recent_stories`, `_seen_cves`) сбрасывается при
+  рестарте контейнера.
+- **KEV ↔ RSS**: подавление дубля KEV новостью ещё не включено.
 
 ---
 
@@ -103,11 +121,8 @@ sec-bot/
 ```bash
 git clone <repo-url> sec-bot && cd sec-bot
 
-cat > .env <<'EOF'
-DEEPSEEK_API_KEY=sk-...
-TELEGRAM_TOKEN=123456789:AA...
-TELEGRAM_CHAT_ID=-1001234567890
-EOF
+cp .env.example .env      # и впишите свои ключи
+$EDITOR .env
 chmod 600 .env
 
 docker compose up -d --build
@@ -371,7 +386,7 @@ python -m unittest discover -s tests -v
 
 То же самое прогоняется в CI (GitHub Actions) на каждый push и PR:
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Конфиги — в
-[`pyproject.toml`](pyproject.toml).
+[`pyproject.toml`](pyproject.toml). Тестов — 92.
 
 ---
 
@@ -440,9 +455,23 @@ watchdog (например, `willfarrell/autoheal`).
 
 ---
 
+## Участие
+
+Issues и PR приветствуются, но у проекта нет roadmap и гарантий поддержки —
+это личный инструмент, который развивается по мере необходимости.
+
+---
+
 ## Идеи для развития
 
-- Хранить историю в SQLite вместо JSON — при росте числа лент и источников.
+- Включить реальный пропуск дублей (story/KEV) после калибровки порогов.
+- Вынести конфиг (ленты, пороги, промпты) из констант в файл.
+- Разбить `app.py` на модули (`sources`, `state`, `delivery`) — при добавлении NVD.
+- Хранить историю в SQLite — при росте числа лент и источников.
 - Добавить второй канал (например, для «только критичного»).
-- Кэшировать анализ по нормализованному заголовку, если ленты дублируют новость.
-- Метрики/healthcheck-эндпоинт для мониторинга живости.
+
+---
+
+## Лицензия
+
+MIT — см. [LICENSE](LICENSE). Автор: Sergey Kravchenko.
