@@ -21,8 +21,8 @@ CISA KEV (Known Exploited Vulnerabilities), просит DeepSeek оценить
 Личный проект для собственного мониторинга, а не продукт и не SOC-платформа:
 один Telegram-канал, конфиг в константах, без веб-интерфейса и мультипользовательности.
 
-- **Дедупликация** работает в сухом режиме: `story_dupes`, `story_max` и
-  `kev_covered` собирают статистику, но ничего не отбрасывают.
+- **Дедупликация** работает в сухом режиме: `story_dupes`, `story_max`,
+  `kev_covered` и `llm_dupes` собирают статистику, но ничего не отбрасывают.
 - **Состояние в памяти** (`_recent_stories`, `_seen_cves`) сбрасывается при
   рестарте контейнера.
 - **KEV ↔ RSS**: подавление дубля KEV новостью ещё не включено.
@@ -34,18 +34,19 @@ CISA KEV (Known Exploited Vulnerabilities), просит DeepSeek оценить
 1. Собирает до 20 записей с каждой из 6 RSS-лент за последние 24 часа —
    глубина сбора больше глубины доставки.
 2. Пропускает то, что уже отправлял — дубли не попадают в канал.
-3. Отправляет до 20 самых свежих статей за цикл в DeepSeek с промптом
-   на строгий формат ответа:
+3. Отправляет до 20 самых свежих статей за цикл в DeepSeek **пачками по 10**.
+   Один вызов на пачку возвращает JSON: критичность, перевод заголовка,
+   «Суть», «Детали» и `duplicate_of` — номер более ранней новости, если
+   перед ним то же событие другими словами:
 
+   ```json
+   {"items": [{"i": 0, "criticality": 5, "title_ru": "…", "summary_ru": "…", "details_ru": "…", "duplicate_of": null}]}
    ```
-   [Критичность: 1-5] (5 — 0-day/массовый взлом, 1 — мнение)
-   Суть: одно предложение.
-   Детали: 2-3 предложения.
-   TITLE_RU: перевод заголовка на русский
-   ```
+
+   Битый JSON не роняет цикл: срабатывает фолбэк на поштучный разбор.
 
 4. Классифицирует результат: **5 → 🔴 алерты**, **4 → 🟡 контекст** (с `⚠️`),
-   остальное и неанализированное — тоже в контекст (с `·`).
+   остальное и неанализированное — тоже в контекст.
 5. Публикует тремя потоками: `🆕 CISA KEV` (отдельно), `🔴 Алерты`
    (пачками по 5) и `🟡 Контекст` (строками). Оригинальный заголовок
    остаётся для поиска, перевод идёт следом через `·`
@@ -263,6 +264,9 @@ CISA (`/cybersecurity-advisories/all.xml`) убрана: их CDN (Akamai) от�
 - **KEV ↔ RSS**: `kev_covered` в `[cycle]` показывает, сколько KEV-записей
   уже освещены новостью (по CVE). Пока только считается и логируется
   `[dedup] KEV covered by news: CVE-…`; отправку не меняет.
+- **LLM-группировка**: батч-анализ видит пачку заголовков целиком и помечает
+  дубли через `duplicate_of`. В `[cycle]` это `llm_dupes`, в логе —
+  `[dedup] LLM: #2 ≈ #1`. Пока только диагностика: отправку не меняет.
 
 Полезные команды:
 
@@ -324,6 +328,8 @@ docker compose restart                          # и отправить всё �
 | `FETCH_DEPTH` | `20` | максимум записей с ленты за цикл |
 | `FETCH_WINDOW_HOURS` | `24` | окно свежести для RSS |
 | `ANALYZE_PER_CYCLE` | `20` | сколько статей за цикл уходит в LLM |
+| `ANALYSIS_BATCH_SIZE` | `10` | сколько новостей в одном вызове LLM |
+| `ANALYSIS_BATCH_TIMEOUT` | `120` | таймаут батч-запроса, сек |
 | `ALERTS_PER_MESSAGE` | `5` | алертов в одном сообщении (или лимит 4000) |
 | `P1_MAX_MESSAGES` | `5` | максимум сообщений с алертами; излишек → дайджест |
 | `DIGEST_SPLIT_LIMIT` | `4000` | символов на сообщение (UTF-16) |
@@ -354,7 +360,7 @@ docker compose restart                          # и отправить всё �
 2026-11-04 13:35:12 [INFO] sec-bot: Читаю ленту: https://www.securityweek.com/feed/
 2026-11-04 13:35:12 [INFO] sec-bot: [RSS] https://www.securityweek.com/feed/: collected 9 of 10 in 24 h
 2026-11-04 13:35:13 [INFO] sec-bot: [RSS] https://thehackernews.com/feeds/posts/default: collected 13 of 20 in 24 h
-2026-11-04 13:35:21 [INFO] sec-bot: [cycle] collected=39 kev=0 rss_new=2 window_dropped=56 dup_seen=37 dup_cycle=0 analyzed=2 ru_missing=0 cve_total=2 cve_dupes=0 story_dupes=0 story_max=0.00 kev_covered=0 alerts=0 digest=2 messages=1 delivered=2 seen=142 dry_run=False
+2026-11-04 13:35:21 [INFO] sec-bot: [cycle] collected=39 kev=0 rss_new=2 window_dropped=56 dup_seen=37 dup_cycle=0 analyzed=2 ru_missing=0 cve_total=2 cve_dupes=0 story_dupes=0 story_max=0.00 kev_covered=0 llm_dupes=0 alerts=0 digest=2 messages=1 delivered=2 seen=142 dry_run=False
 2026-11-04 13:35:21 [INFO] sec-bot: Сплю 6 ч до следующей проверки
 ```
 

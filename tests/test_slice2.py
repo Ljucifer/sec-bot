@@ -124,11 +124,14 @@ class AnalyzeCandidatesTests(unittest.TestCase):
             return "[Критичность: 3] Суть: тест."
 
         original = app.analyze_news
+        original_batch = app.analyze_batch
         app.analyze_news = fake_analyze
+        app.analyze_batch = lambda client, items: None
         try:
             analyzed, rest = app.analyze_candidates(items, object())
         finally:
             app.analyze_news = original
+            app.analyze_batch = original_batch
 
         self.assertEqual(len(analyzed), app.ANALYZE_PER_CYCLE)
         self.assertEqual(len(rest), 30 - app.ANALYZE_PER_CYCLE)
