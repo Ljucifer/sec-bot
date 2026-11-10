@@ -207,9 +207,12 @@ class AnalyzeCandidatesBatchTests(unittest.TestCase):
 
     def test_auth_error_propagates(self):
         original = app.analyze_batch
+        # У настоящего openai.AuthenticationError обязательны response и body,
+        # поэтому создаём экземпляр без вызова конструктора.
+        auth_error = app.AuthenticationError.__new__(app.AuthenticationError)
 
         def broken_batch(client, chunk):
-            raise app.AuthenticationError("bad key")
+            raise auth_error
 
         app.analyze_batch = broken_batch
         try:
