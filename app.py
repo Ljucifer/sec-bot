@@ -1416,6 +1416,48 @@ def render_alert(item: dict) -> str:
     return build_alert_block(item["title"], item["link"], item.get("analysis") or "")
 
 
+def _kev_header(count: int) -> str:
+    return (
+        f"🆕 <b>CISA KEV</b> — {count} "
+        f"{plural(count, 'новая запись', 'новые записи', 'новых записей')}"
+    )
+
+
+def _alerts_header(count: int) -> str:
+    return (
+        f"🔴 <b>Алерты</b> — {count} "
+        f"{plural(count, 'алерт', 'алерта', 'алертов')}"
+    )
+
+
+def _digest_header(count: int) -> str:
+    return (
+        f"🟡 <b>Контекст</b> — {count} "
+        f"{plural(count, 'новость', 'новости', 'новостей')}"
+    )
+
+
+def build_batches(
+    items: list[dict],
+    render,
+    header,
+    limit: int = DIGEST_SPLIT_LIMIT,
+    separator: str = "\n\n",
+    max_items: int | None = None,
+) -> list[tuple[str, list[dict]]]:
+    """Готовит сообщения: каждая пачка получает свой заголовок с её числом."""
+    if not items:
+        return []
+
+    groups = split_items(
+        items, render, header(len(items)), limit, separator, max_items
+    )
+    return [
+        (render_group(group, render, header(len(group)), separator), group)
+        for group in groups
+    ]
+
+
 def render_digest(item: dict) -> str:
     """Рендер строки дайджеста."""
     return build_digest_line(
@@ -1637,22 +1679,12 @@ def process_all_feeds(
     digest = [item for item in analyzed if item.get("criticality") != 5] + unanalyzed
 
     # 6. KEV-сообщения (первыми).
-    kev_header = (
-        f"🆕 <b>CISA KEV</b> — {len(kev_articles)} "
-        f"{plural(len(kev_articles), 'новая запись', 'новые записи', 'новых записей')}"
+    kev_batches = build_batches(
+        kev_articles, build_kev_line, _kev_header, DIGEST_SPLIT_LIMIT, "\n"
     )
-    kev_batches = [
-        (render_group(group, build_kev_line, kev_header, "\n"), group)
-        for group in split_items(
-            kev_articles, build_kev_line, kev_header, DIGEST_SPLIT_LIMIT, "\n"
-        )
-    ]
 
     # 7. Алерты — пачки не больше ALERTS_PER_MESSAGE и 4000 символов.
-    alerts_header = (
-        f"🔴 <b>Алерты</b> — {len(alerts)} "
-        f"{plural(len(alerts), 'алерт', 'алерта', 'алертов')}"
-    )
+    alerts_header = _alerts_header(len(alerts))
     alert_groups = split_items(
         alerts,
         render_alert,
@@ -1677,7 +1709,7 @@ def process_all_feeds(
         )
 
     alert_batches = [
-        (render_group(group, render_alert, alerts_header, "\n\n"), group)
+        (render_group(group, render_alert, _alerts_header(len(group)), "\n\n"), group)
         for group in alert_groups
     ]
 
@@ -1686,16 +1718,9 @@ def process_all_feeds(
         key=lambda item: (item.get("criticality") or 0, item.get("published") or ""),
         reverse=True,
     )
-    digest_header = (
-        f"🟡 <b>Контекст</b> — {len(digest)} "
-        f"{plural(len(digest), 'новость', 'новости', 'новостей')}"
+    digest_batches = build_batches(
+        digest, render_digest, _digest_header, DIGEST_SPLIT_LIMIT, "\n"
     )
-    digest_batches = [
-        (render_group(group, render_digest, digest_header, "\n"), group)
-        for group in split_items(
-            digest, render_digest, digest_header, DIGEST_SPLIT_LIMIT, "\n"
-        )
-    ]
 
     # 9. Доставка: KEV → алерты → дайджест.
     batches = kev_batches + alert_batches + digest_batches

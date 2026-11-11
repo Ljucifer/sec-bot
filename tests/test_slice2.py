@@ -139,6 +139,33 @@ class AnalyzeCandidatesTests(unittest.TestCase):
         self.assertEqual(len(calls), app.ANALYZE_PER_CYCLE)
 
 
+class MessageHeaderTests(unittest.TestCase):
+    def test_headers_use_correct_plural_forms(self):
+        self.assertEqual(app._digest_header(1), "🟡 <b>Контекст</b> — 1 новость")
+        self.assertEqual(app._digest_header(5), "🟡 <b>Контекст</b> — 5 новостей")
+        self.assertEqual(app._kev_header(1), "🆕 <b>CISA KEV</b> — 1 новая запись")
+        self.assertEqual(app._alerts_header(2), "🔴 <b>Алерты</b> — 2 алерта")
+
+    def test_split_messages_get_own_counts(self):
+        items = [make_item(index) for index in range(6)]
+
+        batches = app.build_batches(
+            items,
+            app.render_digest,
+            app._digest_header,
+            limit=80,
+            separator="\n",
+        )
+
+        self.assertGreater(len(batches), 1)
+        total = 0
+        for text, group in batches:
+            total += len(group)
+            header = text.split("\n", 1)[0]
+            self.assertIn(f"— {len(group)} ", header)
+        self.assertEqual(total, 6)
+
+
 class DeliverBatchesTests(unittest.TestCase):
     def setUp(self):
         self.original = {
