@@ -166,6 +166,84 @@ class MessageHeaderTests(unittest.TestCase):
         self.assertEqual(total, 6)
 
 
+class ZdiGroupTests(unittest.TestCase):
+    @staticmethod
+    def _zdi(index, product="Meta FAIRChem", suffix="utils"):
+        link = f"https://www.zerodayinitiative.com/advisories/ZDI-26-{index}/"
+        return {
+            "title": (
+                f"ZDI-26-{index}: (0Day) {product} {suffix} "
+                "Deserialization of Untrusted Data Remote Code Execution Vulnerability"
+            ),
+            "link": link,
+            "key": link,
+            "summary": "",
+            "published": f"2026-11-11T{index % 24:02d}:00:00+00:00",
+            "criticality": 4,
+            "analysis": "разбор",
+            "title_ru": "перевод",
+        }
+
+    def test_product_key(self):
+        self.assertEqual(
+            app._zdi_product_key(
+                "ZDI-26-945: (0Day) Meta FAIRChem utils load_model Vulnerability"
+            ),
+            "Meta FAIRChem",
+        )
+        self.assertIsNone(app._zdi_product_key("Google fixes Chrome zero-day"))
+
+    def test_groups_only_when_threshold_reached(self):
+        items = [
+            self._zdi(945),
+            self._zdi(946),
+            self._zdi(947),
+            self._zdi(950, "Meta fairseq", "dump"),
+            self._zdi(951, "Meta fairseq", "load"),
+        ]
+
+        grouped = app.group_zdi_items(items)
+
+        self.assertEqual(len(grouped), 3)
+        self.assertTrue(grouped[0]["zdi_group"])
+        self.assertEqual(len(grouped[0]["items"]), 3)
+        self.assertFalse(grouped[1].get("zdi_group"))
+
+    def test_group_block_keeps_all_links(self):
+        items = [self._zdi(945), self._zdi(946), self._zdi(947)]
+        block = app.group_zdi_items(items)[0]
+
+        text = app.render_digest(block)
+
+        for index in (945, 946, 947):
+            self.assertIn(f"ZDI-26-{index}/", text)
+        self.assertIn("3 advisories", text)
+
+    def test_delivery_marks_all_children_as_seen(self):
+        items = [self._zdi(945), self._zdi(946), self._zdi(947)]
+        block = app.group_zdi_items(items)[0]
+
+        original = {
+            "send_telegram_message": app.send_telegram_message,
+            "save_seen_urls": app.save_seen_urls,
+            "MESSAGE_PAUSE_SECONDS": app.MESSAGE_PAUSE_SECONDS,
+        }
+        app.send_telegram_message = lambda *args: None
+        app.save_seen_urls = lambda seen: None
+        app.MESSAGE_PAUSE_SECONDS = 0
+        try:
+            seen = set()
+            messages, delivered = app.deliver_batches(
+                [("x", [block])], "t", "c", seen
+            )
+        finally:
+            for name, value in original.items():
+                setattr(app, name, value)
+
+        self.assertEqual((messages, delivered), (1, 3))
+        self.assertEqual(len(seen), 3)
+
+
 class DeliverBatchesTests(unittest.TestCase):
     def setUp(self):
         self.original = {

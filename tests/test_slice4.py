@@ -29,7 +29,17 @@ def make_client(content, calls):
     )
 
 
-def entry(index, criticality=3, duplicate_of=None, title_ru=None, summary="S", details="D"):
+def entry(
+    index,
+    criticality=3,
+    duplicate_of=None,
+    title_ru=None,
+    summary="S",
+    details="D",
+    overlap=None,
+):
+    if overlap is None:
+        overlap = "full" if duplicate_of is not None else "none"
     return {
         "i": index,
         "criticality": criticality,
@@ -37,6 +47,7 @@ def entry(index, criticality=3, duplicate_of=None, title_ru=None, summary="S", d
         "summary_ru": summary,
         "details_ru": details,
         "duplicate_of": duplicate_of,
+        "overlap": overlap,
     }
 
 
@@ -102,6 +113,27 @@ class BatchParseTests(unittest.TestCase):
         self.assertIsNone(parsed[1]["duplicate_of"])
         self.assertEqual(parsed[2]["duplicate_of"], 0)
 
+    def test_overlap_normalized(self):
+        items = [
+            dict(entry(0, duplicate_of=None)),
+            dict(entry(1, duplicate_of=0, overlap="FULL")),
+            dict(entry(2, duplicate_of=0, overlap="partial")),
+            dict(entry(3, duplicate_of=0, overlap="junk")),
+            {
+                key: value
+                for key, value in entry(4, duplicate_of=0).items()
+                if key != "overlap"
+            },
+        ]
+
+        parsed = app._parse_batch_response(json.dumps({"items": items}), 5)
+
+        self.assertEqual(parsed[0]["overlap"], "none")
+        self.assertEqual(parsed[1]["overlap"], "full")
+        self.assertEqual(parsed[2]["overlap"], "partial")
+        self.assertEqual(parsed[3]["overlap"], "partial")
+        self.assertEqual(parsed[4]["overlap"], "partial")
+
     def test_non_dict_entries_ignored(self):
         raw = json.dumps({"items": ["мусор", entry(0)]})
         parsed = app._parse_batch_response(raw, 1)
@@ -155,6 +187,7 @@ class AnalyzeCandidatesBatchTests(unittest.TestCase):
         self.assertEqual(chunks, [10, 10])
         self.assertEqual(analyzed[0]["title_ru"], "RU 0")
         self.assertEqual(analyzed[1]["duplicate_of"], 0)
+        self.assertEqual(analyzed[1]["overlap"], "full")
         self.assertEqual(analyzed[0]["criticality"], 3)
 
     def test_falls_back_to_single_calls(self):
