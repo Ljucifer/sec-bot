@@ -1458,6 +1458,31 @@ def analyze_candidates(
     return analyzed, rest
 
 
+def drop_full_duplicates(
+    analyzed: list[dict],
+    seen_urls: SeenStore,
+) -> tuple[list[dict], int]:
+    """Убирает полные дубли (overlap=full) и помечает их просмотренными.
+
+    Помечаем сразу, иначе дубль вернётся в следующем цикле и будет
+    повторно проанализирован. Оригинал при этом остаётся: если его
+    сообщение не отправится, новость повторится в следующем цикле.
+    """
+    duplicates = [item for item in analyzed if item.get("overlap") == "full"]
+    if not duplicates:
+        return analyzed, 0
+
+    remaining = [item for item in analyzed if item.get("overlap") != "full"]
+    seen_urls.update(item["key"] for item in duplicates)
+    save_seen_urls(seen_urls)
+    log.info(
+        "[dedup] skipped %d %s (overlap=full)",
+        len(duplicates),
+        plural(len(duplicates), "дубль", "дубля", "дублей"),
+    )
+    return remaining, len(duplicates)
+
+
 def build_kev_line(article: dict) -> str:
     """Строка KEV-сообщения: CVE, оригинальное название и перевод (если есть)."""
     cve_id = html.escape(str(article.get("cve_id") or "CVE"))
@@ -1775,7 +1800,7 @@ def process_all_feeds(
 
     # 4. Анализ самых свежих.
     analyzed, unanalyzed = analyze_candidates(fresh, client)
-    full_dupes = sum(1 for item in analyzed if item.get("overlap") == "full")
+    analyzed, full_dupes = drop_full_duplicates(analyzed, seen_urls)
     partial_dupes = sum(1 for item in analyzed if item.get("overlap") == "partial")
 
     # 5. Классификация: 5 — алерты, остальное — контекст.

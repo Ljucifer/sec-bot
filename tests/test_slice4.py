@@ -255,5 +255,40 @@ class AnalyzeCandidatesBatchTests(unittest.TestCase):
             app.analyze_batch = original
 
 
+class DropFullDuplicatesTests(unittest.TestCase):
+    def setUp(self):
+        self._original = app.save_seen_urls
+        self.saved: list[list[str]] = []
+        app.save_seen_urls = lambda seen: self.saved.append(list(seen.order))
+
+    def tearDown(self):
+        app.save_seen_urls = self._original
+
+    def test_removes_only_full_duplicates(self):
+        items = [
+            {"key": "k1", "overlap": "none"},
+            {"key": "k2", "overlap": "full"},
+            {"key": "k3", "overlap": "partial"},
+        ]
+        seen = app.SeenStore(["old"])
+
+        remaining, skipped = app.drop_full_duplicates(items, seen)
+
+        self.assertEqual([item["key"] for item in remaining], ["k1", "k3"])
+        self.assertEqual(skipped, 1)
+        self.assertIn("k2", seen)
+        self.assertEqual(len(self.saved), 1)
+
+    def test_nothing_to_drop(self):
+        items = [{"key": "k1", "overlap": "partial"}]
+        seen = app.SeenStore()
+
+        remaining, skipped = app.drop_full_duplicates(items, seen)
+
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(skipped, 0)
+        self.assertEqual(self.saved, [])
+
+
 if __name__ == "__main__":
     unittest.main()

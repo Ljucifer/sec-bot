@@ -308,6 +308,7 @@ class PipelineTests(unittest.TestCase):
             "fetch_kev_articles": app.fetch_kev_articles,
             "translate_kev_articles": app.translate_kev_articles,
             "analyze_news": app.analyze_news,
+            "analyze_batch": app.analyze_batch,
             "send_telegram_message": app.send_telegram_message,
             "save_seen_urls": app.save_seen_urls,
             "DRY_RUN": app.DRY_RUN,
@@ -348,6 +349,34 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("2 алерта", alert_text)  # 20 и 10 попали в анализ
         self.assertTrue(any("🔴" in text for text in sent))
         self.assertTrue(any("🟡" in text for text in sent))
+
+    def test_full_duplicate_is_skipped_and_marked_seen(self):
+        items = [make_item(0), make_item(1)]
+        app.fetch_feed_news = lambda feed_url: (items, len(items))
+        app.fetch_kev_articles = lambda seen: []
+
+        def fake_batch(client, chunk):
+            return [
+                {
+                    "criticality": 3,
+                    "title_ru": f"RU {offset}",
+                    "summary_ru": "s",
+                    "details_ru": "d",
+                    "duplicate_of": 0 if offset == 1 else None,
+                    "overlap": "full" if offset == 1 else "none",
+                }
+                for offset, _item in enumerate(chunk)
+            ]
+
+        app.analyze_batch = fake_batch
+        sent: list[str] = []
+        app.send_telegram_message = lambda token, chat_id, text: sent.append(text)
+
+        seen = app.SeenStore()
+        app.process_all_feeds(object(), "t", "c", seen)
+
+        self.assertIn("<b>Контекст</b> — 1 новость", sent[0])
+        self.assertEqual(len(seen), 2)
 
     def test_dry_run_keeps_history(self):
         app.DRY_RUN = True
