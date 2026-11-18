@@ -126,7 +126,7 @@ class AnalyzeCandidatesTests(unittest.TestCase):
         original = app.analyze_news
         original_batch = app.analyze_batch
         app.analyze_news = fake_analyze
-        app.analyze_batch = lambda client, items: None
+        app.analyze_batch = lambda client, items, recent=None: None
         try:
             analyzed, rest = app.analyze_candidates(items, object())
         finally:
@@ -355,7 +355,7 @@ class PipelineTests(unittest.TestCase):
         app.fetch_feed_news = lambda feed_url: (items, len(items))
         app.fetch_kev_articles = lambda seen: []
 
-        def fake_batch(client, chunk):
+        def fake_batch(client, chunk, recent=None):
             return [
                 {
                     "criticality": 3,

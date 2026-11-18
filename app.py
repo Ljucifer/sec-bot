@@ -73,8 +73,9 @@ BATCH_ANALYSIS_PROMPT = (
     "title_ru — перевод заголовка на русский, одной строкой; "
     "summary_ru — суть одним предложением; "
     "details_ru — детали, 2-3 предложения; "
-    "duplicate_of — номер БОЛЕЕ РАННЕЙ новости, если эта описывает то же "
-    "событие другими словами, иначе null; "
+    "duplicate_of — номер более ранней новости из текущего списка; -1, если "
+    "новость повторяет одну из ранее отправленных (блок «Ранее отправлено»); "
+    "иначе null; "
     "overlap — степень совпадения: full (то же событие в том же объёме), "
     "partial (пересечение: раундап или другая грань события), none. "
     "Ответ строго JSON: {\"items\": [...]}, без текста вокруг. "
@@ -132,6 +133,11 @@ KEV_WINDOW_DAYS = 7
 # отправляются, они не попадают в seen_urls, и без этой памяти один и тот
 # же топ логировался бы каждые 6 часов.
 _reported_kev: set[str] = set()
+
+# Заголовки за последние 24 ч для межциклового контекста батч-анализа.
+RECENT_TITLES_TTL = 24 * 60 * 60
+RECENT_TITLES_LIMIT = 30
+_recent_titles: list[dict] = []
 
 # CVE, встреченные в этом процессе: для «сухой» статистики дублей.
 _seen_cves: set[str] = set()
@@ -726,6 +732,46 @@ def _prune_stories(now: float) -> None:
     ]
 
 
+def _prune_recent_titles(now: float) -> None:
+    """Убирает из памяти заголовки старше RECENT_TITLES_TTL."""
+    global _recent_titles
+    _recent_titles = [
+        entry for entry in _recent_titles if now - entry["ts"] <= RECENT_TITLES_TTL
+    ]
+
+
+def recent_titles_snapshot() -> list[str]:
+    """Последние заголовки для промпта: свежие первыми, не больше лимита."""
+    now = time.time()
+    _prune_recent_titles(now)
+    titles = [entry["title"] for entry in _recent_titles[-RECENT_TITLES_LIMIT:]]
+    titles.reverse()
+    return titles
+
+
+def remember_titles(items: list[dict]) -> None:
+    """Запоминает заголовки отправленных новостей для следующих циклов."""
+    now = time.time()
+    for item in items:
+        title = str(item.get("title") or "").strip()
+        if title:
+            _recent_titles.append({"ts": now, "title": title})
+    _prune_recent_titles(now)
+
+
+def _best_recent_match(title: str, recent: list[str]) -> str:
+    """Ближайший по словам старый заголовок — только для лога."""
+    words = _story_words(title)
+    best = ""
+    best_score = 0.0
+    for old in recent:
+        score = _story_similarity(words, _story_words(old))
+        if score > best_score:
+            best = old
+            best_score = score
+    return best or "—"
+
+
 def _story_similarity(words: set[str], other: set[str]) -> float:
     """Сходство заголовков по Jaccard; короткие наборы не сравниваем."""
     if len(words) < 3 or len(other) < 3:
@@ -1000,7 +1046,9 @@ def _parse_batch_response(raw: str, count: int) -> list[dict | None] | None:
             criticality = max(1, min(5, criticality))
 
         duplicate_of = entry.get("duplicate_of")
-        if (
+        if duplicate_of == -1:
+            pass
+        elif (
             isinstance(duplicate_of, bool)
             or not isinstance(duplicate_of, int)
             or not 0 <= duplicate_of < count
@@ -1043,22 +1091,37 @@ def _compose_analysis(entry: dict) -> str:
     return "\n".join(lines)
 
 
-def analyze_batch(client: OpenAI, items: list[dict]) -> list[dict | None] | None:
+def analyze_batch(
+    client: OpenAI,
+    items: list[dict],
+    recent_titles: list[str] | None = None,
+) -> list[dict | None] | None:
     """Один вызов LLM на пачку новостей.
 
-    Возвращает записи по индексам (None — для отсутствующих/битых) или None,
-    если запрос/разбор целиком не удался: тогда вызывающий делает фолбэк.
+    `recent_titles` — заголовки, отправленные ранее: модель может пометить
+    новость как повтор через duplicate_of = -1.
     """
     numbered = [
         f"[{index}] {item['title']}\n{item.get('summary') or 'Текст недоступен.'}"
         for index, item in enumerate(items)
     ]
+    user_blocks = []
+    if recent_titles:
+        recent = "\n".join(
+            f"[-{position}] {title}"
+            for position, title in enumerate(recent_titles, start=1)
+        )
+        user_blocks.append(
+            "Ранее уже отправлено (если новость повторяет одну из этих, "
+            "поставь duplicate_of: -1):\n" + recent
+        )
+    user_blocks.append("\n\n".join(numbered))
 
     response = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=[
             {"role": "system", "content": BATCH_ANALYSIS_PROMPT},
-            {"role": "user", "content": "\n\n".join(numbered)},
+            {"role": "user", "content": "\n\n".join(user_blocks)},
         ],
         temperature=0.2,
         max_tokens=min(
@@ -1405,12 +1468,13 @@ def analyze_candidates(
     ordered = sorted(items, key=lambda it: it.get("published") or "", reverse=True)
     budget = ordered[:ANALYZE_PER_CYCLE]
     analyzed: list[dict] = []
+    recent = recent_titles_snapshot()
 
     for start in range(0, len(budget), ANALYSIS_BATCH_SIZE):
         chunk = budget[start : start + ANALYSIS_BATCH_SIZE]
 
         try:
-            entries = analyze_batch(client, chunk)
+            entries = analyze_batch(client, chunk, recent)
         except AuthenticationError as exc:
             log.critical("FATAL: DeepSeek API key is invalid: %s", exc)
             raise
@@ -1432,7 +1496,14 @@ def analyze_candidates(
 
             duplicate_of = entry["duplicate_of"] if entry else None
             overlap = entry["overlap"] if entry else "none"
-            if duplicate_of is not None and 0 <= duplicate_of < offset:
+            if duplicate_of == -1:
+                log.info(
+                    "[dedup] LLM cross %s: %s ≈ %s",
+                    overlap,
+                    item.get("title"),
+                    _best_recent_match(str(item.get("title") or ""), recent),
+                )
+            elif duplicate_of is not None and 0 <= duplicate_of < offset:
                 log.info(
                     "[dedup] LLM %s: #%d ≈ #%d: %s ≈ %s",
                     overlap,
@@ -1468,11 +1539,19 @@ def drop_full_duplicates(
     повторно проанализирован. Оригинал при этом остаётся: если его
     сообщение не отправится, новость повторится в следующем цикле.
     """
-    duplicates = [item for item in analyzed if item.get("overlap") == "full"]
+    duplicates = [
+        item
+        for item in analyzed
+        if item.get("overlap") == "full" and item.get("duplicate_of") != -1
+    ]
     if not duplicates:
         return analyzed, 0
 
-    remaining = [item for item in analyzed if item.get("overlap") != "full"]
+    remaining = [
+        item
+        for item in analyzed
+        if not (item.get("overlap") == "full" and item.get("duplicate_of") != -1)
+    ]
     seen_urls.update(item["key"] for item in duplicates)
     save_seen_urls(seen_urls)
     log.info(
@@ -1800,8 +1879,10 @@ def process_all_feeds(
 
     # 4. Анализ самых свежих.
     analyzed, unanalyzed = analyze_candidates(fresh, client)
+    remember_titles(fresh)
     analyzed, full_dupes = drop_full_duplicates(analyzed, seen_urls)
     partial_dupes = sum(1 for item in analyzed if item.get("overlap") == "partial")
+    cross_dupes = sum(1 for item in analyzed if item.get("duplicate_of") == -1)
 
     # 5. Классификация: 5 — алерты, остальное — контекст.
     alerts = [item for item in analyzed if item.get("criticality") == 5]
@@ -1872,7 +1953,7 @@ def process_all_feeds(
         "[cycle] collected=%d kev=%d rss_new=%d window_dropped=%d "
         "dup_seen=%d dup_cycle=%d analyzed=%d ru_missing=%d "
         "cve_total=%d cve_dupes=%d story_dupes=%d story_max=%.2f "
-        "kev_covered=%d full_dupes=%d partial_dupes=%d "
+        "kev_covered=%d full_dupes=%d partial_dupes=%d cross_dupes=%d "
         "alerts=%d digest=%d messages=%d "
         "delivered=%d seen=%d dry_run=%s",
         len(rss_items) + len(kev_articles),
@@ -1890,6 +1971,7 @@ def process_all_feeds(
         kev_covered,
         full_dupes,
         partial_dupes,
+        cross_dupes,
         len(alerts),
         digest_accounted,
         len(batches),

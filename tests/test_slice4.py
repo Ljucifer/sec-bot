@@ -3,6 +3,7 @@
 import json
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import app
 
@@ -134,6 +135,13 @@ class BatchParseTests(unittest.TestCase):
         self.assertEqual(parsed[3]["overlap"], "partial")
         self.assertEqual(parsed[4]["overlap"], "partial")
 
+    def test_duplicate_of_minus_one_allowed(self):
+        raw = json.dumps({"items": [entry(0, duplicate_of=-1)]})
+
+        parsed = app._parse_batch_response(raw, 1)
+
+        self.assertEqual(parsed[0]["duplicate_of"], -1)
+
     def test_non_dict_entries_ignored(self):
         raw = json.dumps({"items": ["мусор", entry(0)]})
         parsed = app._parse_batch_response(raw, 1)
@@ -155,13 +163,24 @@ class AnalyzeBatchTests(unittest.TestCase):
         self.assertIn("[1] News #1", user)
         self.assertIn("duplicate_of", calls[0]["messages"][0]["content"])
 
+    def test_recent_titles_go_to_prompt(self):
+        calls = []
+        payload = json.dumps({"items": [entry(0)]})
+        client = make_client(payload, calls)
+
+        app.analyze_batch(client, [make_item(0)], ["Old story one"])
+
+        user = calls[0]["messages"][1]["content"]
+        self.assertIn("Ранее уже отправлено", user)
+        self.assertIn("[-1] Old story one", user)
+
 
 class AnalyzeCandidatesBatchTests(unittest.TestCase):
     def test_uses_batch_and_keeps_duplicate_links(self):
         items = [make_item(index) for index in range(25)]
         chunks: list[int] = []
 
-        def fake_batch(client, chunk):
+        def fake_batch(client, chunk, recent=None):
             chunks.append(len(chunk))
             result = []
             for offset, _item in enumerate(chunk):
@@ -200,7 +219,7 @@ class AnalyzeCandidatesBatchTests(unittest.TestCase):
 
         original_batch = app.analyze_batch
         original_news = app.analyze_news
-        app.analyze_batch = lambda client, items: None
+        app.analyze_batch = lambda client, items, recent=None: None
         app.analyze_news = fake_news
         try:
             analyzed, _ = app.analyze_candidates(items, object())
@@ -222,7 +241,7 @@ class AnalyzeCandidatesBatchTests(unittest.TestCase):
             calls.append(title)
             return "[Критичность: 3] Суть: суть."
 
-        def broken_batch(client, chunk):
+        def broken_batch(client, chunk, recent=None):
             raise RuntimeError("boom")
 
         original_batch = app.analyze_batch
@@ -244,7 +263,7 @@ class AnalyzeCandidatesBatchTests(unittest.TestCase):
         # поэтому создаём экземпляр без вызова конструктора.
         auth_error = app.AuthenticationError.__new__(app.AuthenticationError)
 
-        def broken_batch(client, chunk):
+        def broken_batch(client, chunk, recent=None):
             raise auth_error
 
         app.analyze_batch = broken_batch
@@ -288,6 +307,44 @@ class DropFullDuplicatesTests(unittest.TestCase):
         self.assertEqual(len(remaining), 1)
         self.assertEqual(skipped, 0)
         self.assertEqual(self.saved, [])
+
+    def test_cross_cycle_duplicate_not_dropped_yet(self):
+        items = [{"key": "k1", "overlap": "full", "duplicate_of": -1}]
+        seen = app.SeenStore()
+
+        remaining, skipped = app.drop_full_duplicates(items, seen)
+
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(skipped, 0)
+
+
+class RecentTitlesTests(unittest.TestCase):
+    def setUp(self):
+        self._original = app._recent_titles
+        app._recent_titles = []
+
+    def tearDown(self):
+        app._recent_titles = self._original
+
+    def test_remembers_and_lists_newest_first(self):
+        with mock.patch.object(app.time, "time", return_value=1000.0):
+            app.remember_titles([{"title": "First"}, {"title": "Second"}])
+        with mock.patch.object(app.time, "time", return_value=1001.0):
+            app.remember_titles([{"title": "Third"}])
+            titles = app.recent_titles_snapshot()
+
+        self.assertEqual(titles, ["Third", "Second", "First"])
+
+    def test_ttl_prunes_old_titles(self):
+        with mock.patch.object(app.time, "time", return_value=1000.0):
+            app.remember_titles([{"title": "Old story"}])
+
+        with mock.patch.object(
+            app.time,
+            "time",
+            return_value=1000.0 + app.RECENT_TITLES_TTL + 1,
+        ):
+            self.assertEqual(app.recent_titles_snapshot(), [])
 
 
 if __name__ == "__main__":
