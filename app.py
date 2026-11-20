@@ -73,9 +73,10 @@ BATCH_ANALYSIS_PROMPT = (
     "title_ru — перевод заголовка на русский, одной строкой; "
     "summary_ru — суть одним предложением; "
     "details_ru — детали, 2-3 предложения; "
-    "duplicate_of — номер более ранней новости из текущего списка; -1, если "
-    "новость повторяет одну из ранее отправленных (блок «Ранее отправлено»); "
-    "иначе null; "
+    "duplicate_of — номер более ранней новости из текущего списка, если она "
+    "описывает то же событие, иначе null; "
+    "seen_before — true, если новость повторяет любую из ранее отправленных "
+    "(блок «Ранее отправлено»), иначе false; "
     "overlap — степень совпадения: full (то же событие в том же объёме), "
     "partial (пересечение: раундап или другая грань события), none. "
     "Ответ строго JSON: {\"items\": [...]}, без текста вокруг. "
@@ -1046,9 +1047,15 @@ def _parse_batch_response(raw: str, count: int) -> list[dict | None] | None:
             criticality = max(1, min(5, criticality))
 
         duplicate_of = entry.get("duplicate_of")
-        if duplicate_of == -1:
-            pass
-        elif (
+        seen_before = entry.get("seen_before") is True
+        if (
+            isinstance(duplicate_of, int)
+            and not isinstance(duplicate_of, bool)
+            and duplicate_of < 0
+        ):
+            # Отрицательный индекс — тоже «уже отправлено» (страховка).
+            seen_before = True
+        if (
             isinstance(duplicate_of, bool)
             or not isinstance(duplicate_of, int)
             or not 0 <= duplicate_of < count
@@ -1064,15 +1071,18 @@ def _parse_batch_response(raw: str, count: int) -> list[dict | None] | None:
         overlap = entry.get("overlap")
         if isinstance(overlap, str) and overlap.strip().lower() in {"full", "partial"}:
             overlap = overlap.strip().lower()
+        elif duplicate_of is not None or seen_before:
+            overlap = "partial"
         else:
-            overlap = "partial" if duplicate_of is not None else "none"
-        if duplicate_of is None:
+            overlap = "none"
+        if duplicate_of is None and not seen_before:
             overlap = "none"
 
         parsed[index] = {
             "criticality": criticality,
             "duplicate_of": duplicate_of,
             "overlap": overlap,
+            "cross": seen_before,
             **fields,
         }
 
@@ -1107,13 +1117,10 @@ def analyze_batch(
     ]
     user_blocks = []
     if recent_titles:
-        recent = "\n".join(
-            f"[-{position}] {title}"
-            for position, title in enumerate(recent_titles, start=1)
-        )
         user_blocks.append(
-            "Ранее уже отправлено (если новость повторяет одну из этих, "
-            "поставь duplicate_of: -1):\n" + recent
+            "Ранее уже отправлено (если новость описывает то же событие, "
+            "что любая из этих, поставь seen_before: true):\n"
+            + "\n".join(recent_titles)
         )
     user_blocks.append("\n\n".join(numbered))
 
@@ -1469,6 +1476,8 @@ def analyze_candidates(
     budget = ordered[:ANALYZE_PER_CYCLE]
     analyzed: list[dict] = []
     recent = recent_titles_snapshot()
+    if recent:
+        log.info("[dedup] context: %d recent titles", len(recent))
 
     for start in range(0, len(budget), ANALYSIS_BATCH_SIZE):
         chunk = budget[start : start + ANALYSIS_BATCH_SIZE]
@@ -1496,7 +1505,8 @@ def analyze_candidates(
 
             duplicate_of = entry["duplicate_of"] if entry else None
             overlap = entry["overlap"] if entry else "none"
-            if duplicate_of == -1:
+            cross = bool(entry.get("cross")) if entry else False
+            if cross:
                 log.info(
                     "[dedup] LLM cross %s: %s ≈ %s",
                     overlap,
@@ -1522,6 +1532,7 @@ def analyze_candidates(
                     "criticality": extract_criticality(clean_analysis),
                     "duplicate_of": duplicate_of,
                     "overlap": overlap,
+                    "cross_duplicate": cross,
                 }
             )
 
@@ -1542,7 +1553,7 @@ def drop_full_duplicates(
     duplicates = [
         item
         for item in analyzed
-        if item.get("overlap") == "full" and item.get("duplicate_of") != -1
+        if item.get("overlap") == "full" and not item.get("cross_duplicate")
     ]
     if not duplicates:
         return analyzed, 0
@@ -1550,7 +1561,7 @@ def drop_full_duplicates(
     remaining = [
         item
         for item in analyzed
-        if not (item.get("overlap") == "full" and item.get("duplicate_of") != -1)
+        if not (item.get("overlap") == "full" and not item.get("cross_duplicate"))
     ]
     seen_urls.update(item["key"] for item in duplicates)
     save_seen_urls(seen_urls)
@@ -1882,7 +1893,7 @@ def process_all_feeds(
     remember_titles(fresh)
     analyzed, full_dupes = drop_full_duplicates(analyzed, seen_urls)
     partial_dupes = sum(1 for item in analyzed if item.get("overlap") == "partial")
-    cross_dupes = sum(1 for item in analyzed if item.get("duplicate_of") == -1)
+    cross_dupes = sum(1 for item in analyzed if item.get("cross_duplicate"))
 
     # 5. Классификация: 5 — алерты, остальное — контекст.
     alerts = [item for item in analyzed if item.get("criticality") == 5]

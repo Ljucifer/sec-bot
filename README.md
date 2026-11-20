@@ -274,7 +274,7 @@ CISA (`/cybersecurity-advisories/all.xml`) убрана: их CDN (Akamai) от�
   частичные остаются.
 - **Межцикловые повторы**: в промпт передаются до 30 заголовков за последние
   24 часа; если новость повторяет одну из них, модель ставит
-  `duplicate_of: -1`. В `[cycle]` это `cross_dupes`, в логе —
+  `seen_before: true`. В `[cycle]` это `cross_dupes`, в логе —
   `[dedup] LLM cross full: … ≈ …`. Пока только диагностика.
 - **ZDI-группировка**: если одного продукта набралось `ZDI_GROUP_MIN`
   advisories, дайджест схлопывает их в один блок — «ZDI: Meta FAIRChem —

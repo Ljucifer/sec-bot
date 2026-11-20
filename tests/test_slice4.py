@@ -38,6 +38,7 @@ def entry(
     summary="S",
     details="D",
     overlap=None,
+    seen_before=False,
 ):
     if overlap is None:
         overlap = "full" if duplicate_of is not None else "none"
@@ -49,6 +50,7 @@ def entry(
         "details_ru": details,
         "duplicate_of": duplicate_of,
         "overlap": overlap,
+        "seen_before": seen_before,
     }
 
 
@@ -135,12 +137,21 @@ class BatchParseTests(unittest.TestCase):
         self.assertEqual(parsed[3]["overlap"], "partial")
         self.assertEqual(parsed[4]["overlap"], "partial")
 
-    def test_duplicate_of_minus_one_allowed(self):
+    def test_negative_duplicate_means_seen_before(self):
         raw = json.dumps({"items": [entry(0, duplicate_of=-1)]})
 
         parsed = app._parse_batch_response(raw, 1)
 
-        self.assertEqual(parsed[0]["duplicate_of"], -1)
+        self.assertIsNone(parsed[0]["duplicate_of"])
+        self.assertTrue(parsed[0]["cross"])
+
+    def test_seen_before_flag(self):
+        raw = json.dumps({"items": [entry(0, seen_before=True, overlap="full")]})
+
+        parsed = app._parse_batch_response(raw, 1)
+
+        self.assertTrue(parsed[0]["cross"])
+        self.assertEqual(parsed[0]["overlap"], "full")
 
     def test_non_dict_entries_ignored(self):
         raw = json.dumps({"items": ["мусор", entry(0)]})
@@ -172,7 +183,8 @@ class AnalyzeBatchTests(unittest.TestCase):
 
         user = calls[0]["messages"][1]["content"]
         self.assertIn("Ранее уже отправлено", user)
-        self.assertIn("[-1] Old story one", user)
+        self.assertIn("seen_before: true", user)
+        self.assertIn("Old story one", user)
 
 
 class AnalyzeCandidatesBatchTests(unittest.TestCase):
@@ -257,6 +269,31 @@ class AnalyzeCandidatesBatchTests(unittest.TestCase):
         self.assertEqual(len(analyzed), 1)
         self.assertEqual(calls, ["News #0"])
 
+    def test_cross_duplicate_flag_stored(self):
+        items = [make_item(0)]
+
+        def fake_batch(client, chunk, recent=None):
+            return [
+                {
+                    "criticality": 4,
+                    "title_ru": "RU",
+                    "summary_ru": "s",
+                    "details_ru": "d",
+                    "duplicate_of": None,
+                    "overlap": "full",
+                    "cross": True,
+                }
+            ]
+
+        original = app.analyze_batch
+        app.analyze_batch = fake_batch
+        try:
+            analyzed, _ = app.analyze_candidates(items, object())
+        finally:
+            app.analyze_batch = original
+
+        self.assertTrue(analyzed[0]["cross_duplicate"])
+
     def test_auth_error_propagates(self):
         original = app.analyze_batch
         # У настоящего openai.AuthenticationError обязательны response и body,
@@ -309,7 +346,7 @@ class DropFullDuplicatesTests(unittest.TestCase):
         self.assertEqual(self.saved, [])
 
     def test_cross_cycle_duplicate_not_dropped_yet(self):
-        items = [{"key": "k1", "overlap": "full", "duplicate_of": -1}]
+        items = [{"key": "k1", "overlap": "full", "cross_duplicate": True}]
         seen = app.SeenStore()
 
         remaining, skipped = app.drop_full_duplicates(items, seen)
