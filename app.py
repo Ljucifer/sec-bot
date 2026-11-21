@@ -753,13 +753,22 @@ def recent_titles_snapshot() -> list[str]:
 
 
 def remember_titles(items: list[dict]) -> None:
-    """Запоминает заголовки отправленных новостей для следующих циклов."""
+    """Запоминает заголовки и CVE отправленных новостей для следующих циклов."""
     now = time.time()
     for item in items:
         title = str(item.get("title") or "").strip()
         if title:
-            _recent_titles.append({"ts": now, "title": title})
+            _recent_titles.append(
+                {"ts": now, "title": title, "cves": item_cves(item)}
+            )
     _prune_recent_titles(now)
+
+
+def recent_cves_snapshot() -> set[str]:
+    """CVE из реально отправленных новостей за окно контекста."""
+    now = time.time()
+    _prune_recent_titles(now)
+    return {cve for entry in _recent_titles for cve in entry.get("cves", set())}
 
 
 def _best_recent_match(title: str, recent: list[str]) -> str:
@@ -1558,6 +1567,62 @@ def _pick_full_duplicate(group: list[dict]) -> dict:
     )
 
 
+def drop_cve_duplicates(
+    analyzed: list[dict],
+    known_cves: set[str],
+    seen_urls: SeenStore,
+) -> tuple[list[dict], int]:
+    """Убирает повторы по CVE — детерминированный сигнал, не зависящий от LLM.
+
+    Если все CVE новости уже встречались в отправленном за окно контекста —
+    это повтор. Мульти-CVE раундап с хотя бы одним новым CVE не трогаем.
+    Внутри цикла схлопываем новости с одинаковым набором CVE.
+    """
+    dropped: list[dict] = []
+    dropped_ids: set[int] = set()
+
+    for item in analyzed:
+        cves = item_cves(item)
+        if cves and cves <= known_cves:
+            dropped.append(item)
+            dropped_ids.add(id(item))
+            log.info(
+                "[dedup] CVE covered: %s (%s)",
+                item.get("title"),
+                ", ".join(sorted(cves)),
+            )
+
+    by_cves: dict[frozenset[str], list[dict]] = {}
+    for item in analyzed:
+        if id(item) in dropped_ids:
+            continue
+        cve_set = frozenset(item_cves(item))
+        if cve_set:
+            by_cves.setdefault(cve_set, []).append(item)
+
+    for group in by_cves.values():
+        if len(group) < 2:
+            continue
+        keep = _pick_full_duplicate(group)
+        for item in group:
+            if item is not keep:
+                dropped.append(item)
+                dropped_ids.add(id(item))
+
+    if not dropped:
+        return analyzed, 0
+
+    remaining = [item for item in analyzed if id(item) not in dropped_ids]
+    seen_urls.update(item["key"] for item in dropped)
+    save_seen_urls(seen_urls)
+    log.info(
+        "[dedup] skipped %d %s (CVE)",
+        len(dropped),
+        plural(len(dropped), "дубль", "дубля", "дублей"),
+    )
+    return remaining, len(dropped)
+
+
 def drop_full_duplicates(
     analyzed: list[dict],
     seen_urls: SeenStore,
@@ -1968,8 +2033,10 @@ def process_all_feeds(
     kev_covered = kev_covered_by_news(kev_articles, fresh)
 
     # 4. Анализ самых свежих.
+    known_cves = recent_cves_snapshot()
     analyzed, unanalyzed = analyze_candidates(fresh, client)
     cross_dupes = sum(1 for item in analyzed if item.get("cross_duplicate"))
+    analyzed, cve_skipped = drop_cve_duplicates(analyzed, known_cves, seen_urls)
     analyzed, full_dupes = drop_full_duplicates(analyzed, seen_urls)
     partial_dupes = sum(1 for item in analyzed if item.get("overlap") == "partial")
 
@@ -2042,8 +2109,8 @@ def process_all_feeds(
         "[cycle] collected=%d kev=%d rss_new=%d window_dropped=%d "
         "dup_seen=%d dup_cycle=%d analyzed=%d ru_missing=%d "
         "cve_total=%d cve_dupes=%d story_dupes=%d story_max=%.2f "
-        "kev_covered=%d full_dupes=%d partial_dupes=%d cross_dupes=%d "
-        "alerts=%d digest=%d messages=%d "
+        "kev_covered=%d cve_skipped=%d full_dupes=%d partial_dupes=%d "
+        "cross_dupes=%d alerts=%d digest=%d messages=%d "
         "delivered=%d seen=%d dry_run=%s",
         len(rss_items) + len(kev_articles),
         len(kev_articles),
@@ -2058,6 +2125,7 @@ def process_all_feeds(
         story_dupes,
         story_max,
         kev_covered,
+        cve_skipped,
         full_dupes,
         partial_dupes,
         cross_dupes,

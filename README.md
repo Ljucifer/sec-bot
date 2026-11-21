@@ -22,10 +22,10 @@ CISA KEV (Known Exploited Vulnerabilities), просит DeepSeek оценить
 один Telegram-канал, конфиг в константах, без веб-интерфейса и мультипользовательности.
 
 - **Дедупликация**: полные дубли пропускаются и помечаются в истории —
-  и внутри цикла (`overlap=full`), и межцикловые (`cross full`). Из группы
-  дублей остаётся самая информативная новость. Частичные (`partial` —
-  раундапы и follow-up'ы) остаются. `story_dupes`, `story_max` и
-  `kev_covered` тоже собирают статистику.
+  внутри цикла (`overlap=full`), межцикловые (`cross full`) и повторы по CVE.
+  Из группы дублей остаётся самая информативная новость. Частичные
+  (`partial` — раундапы и follow-up'ы) остаются. `story_dupes`, `story_max`
+  и `kev_covered` тоже собирают статистику.
 - **Состояние в памяти** (`_recent_stories`, `_recent_titles`, `_seen_cves`)
   сбрасывается при рестарте контейнера.
 - **KEV ↔ RSS**: подавление дубля KEV новостью ещё не включено.
@@ -273,11 +273,15 @@ CISA (`/cybersecurity-advisories/all.xml`) убрана: их CDN (Akamai) от�
   или другая грань события). В `[cycle]` это `full_dupes`/`partial_dupes`,
   в логе — `[dedup] LLM full: #2 ≈ #1`. Полные дубли не отправляются,
   частичные остаются.
-- **Межцикловые повторы**: в промпт передаются до 30 заголовков за последние
+- **Межцикловые повторы**: в промпт передаются до 60 заголовков за последние
   24 часа; если новость повторяет одну из них, модель ставит
   `seen_before: true`. В `[cycle]` это `cross_dupes`, в логе —
   `[dedup] LLM cross full: … ≈ …`. Полные межцикловые дубли не отправляются,
   частичные остаются.
+- **CVE-дубли**: если все CVE новости уже встречались в отправленном за окно
+  контекста — новость пропускается без обращения к модели; раундап с хотя бы
+  одним новым CVE остаётся. Внутри цикла новости с одинаковым набором CVE
+  схлопываются в одну. В `[cycle]` это `cve_skipped`.
 - **ZDI-группировка**: если одного продукта набралось `ZDI_GROUP_MIN`
   advisories, дайджест схлопывает их в один блок — «ZDI: Meta FAIRChem —
   9 advisories» со ссылками на все записи.
@@ -377,7 +381,7 @@ docker compose restart                          # и отправить всё �
 2026-11-04 13:35:12 [INFO] sec-bot: Читаю ленту: https://www.securityweek.com/feed/
 2026-11-04 13:35:12 [INFO] sec-bot: [RSS] https://www.securityweek.com/feed/: collected 9 of 10 in 24 h
 2026-11-04 13:35:13 [INFO] sec-bot: [RSS] https://thehackernews.com/feeds/posts/default: collected 13 of 20 in 24 h
-2026-11-04 13:35:21 [INFO] sec-bot: [cycle] collected=39 kev=0 rss_new=2 window_dropped=56 dup_seen=37 dup_cycle=0 analyzed=2 ru_missing=0 cve_total=2 cve_dupes=0 story_dupes=0 story_max=0.00 kev_covered=0 full_dupes=0 partial_dupes=0 cross_dupes=0 alerts=0 digest=2 messages=1 delivered=2 seen=142 dry_run=False
+2026-11-04 13:35:21 [INFO] sec-bot: [cycle] collected=39 kev=0 rss_new=2 window_dropped=56 dup_seen=37 dup_cycle=0 analyzed=2 ru_missing=0 cve_total=2 cve_dupes=0 story_dupes=0 story_max=0.00 kev_covered=0 cve_skipped=0 full_dupes=0 partial_dupes=0 cross_dupes=0 alerts=0 digest=2 messages=1 delivered=2 seen=142 dry_run=False
 2026-11-04 13:35:21 [INFO] sec-bot: Сплю 6 ч до следующей проверки
 ```
 

@@ -399,6 +399,81 @@ class DropFullDuplicatesTests(unittest.TestCase):
         self.assertIn("k1", seen)
 
 
+class DropCveDuplicatesTests(unittest.TestCase):
+    def setUp(self):
+        self._original = app.save_seen_urls
+        self.saved: list[list[str]] = []
+        app.save_seen_urls = lambda seen: self.saved.append(list(seen.order))
+
+    def tearDown(self):
+        app.save_seen_urls = self._original
+
+    def test_known_cve_dropped(self):
+        items = [
+            {
+                "key": "k1",
+                "title": "VMware vCenter flaw CVE-2026-1111",
+                "summary": "",
+            }
+        ]
+        seen = app.SeenStore()
+
+        remaining, skipped = app.drop_cve_duplicates(
+            items, {"CVE-2026-1111"}, seen
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(skipped, 1)
+        self.assertIn("k1", seen)
+
+    def test_multi_cve_with_new_one_kept(self):
+        items = [
+            {
+                "key": "k1",
+                "title": "Patch Tuesday fixes CVE-2026-1111 and CVE-2026-2222",
+                "summary": "",
+            }
+        ]
+
+        remaining, skipped = app.drop_cve_duplicates(
+            items, {"CVE-2026-1111"}, app.SeenStore()
+        )
+
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(skipped, 0)
+
+    def test_same_cve_inside_cycle_keeps_best(self):
+        items = [
+            {
+                "key": "a",
+                "title": "VMware flaw CVE-2026-1111",
+                "summary": "short",
+                "criticality": 3,
+            },
+            {
+                "key": "b",
+                "title": "Critical VMware flaw CVE-2026-1111",
+                "summary": "much longer summary",
+                "criticality": 5,
+            },
+        ]
+
+        remaining, skipped = app.drop_cve_duplicates(items, set(), app.SeenStore())
+
+        self.assertEqual([item["key"] for item in remaining], ["b"])
+        self.assertEqual(skipped, 1)
+
+    def test_no_cve_untouched(self):
+        items = [{"key": "k1", "title": "No identifiers here", "summary": ""}]
+
+        remaining, skipped = app.drop_cve_duplicates(
+            items, {"CVE-2026-1111"}, app.SeenStore()
+        )
+
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(skipped, 0)
+
+
 class RecentTitlesTests(unittest.TestCase):
     def setUp(self):
         self._original = app._recent_titles
