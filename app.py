@@ -77,6 +77,8 @@ BATCH_ANALYSIS_PROMPT = (
     "описывает то же событие, иначе null; "
     "seen_before — true, если новость повторяет любую из ранее отправленных "
     "(блок «Ранее отправлено»), иначе false; "
+    "Сравнивай смысл: перефразированный заголовок об одном событии — это повтор; "
+    "совпадение только вендора или общей темы (патчи, утечка) — не повтор. "
     "overlap — степень совпадения: full (то же событие в том же объёме), "
     "partial (пересечение: раундап или другая грань события), none. "
     "Ответ строго JSON: {\"items\": [...]}, без текста вокруг. "
@@ -137,7 +139,7 @@ _reported_kev: set[str] = set()
 
 # Заголовки за последние 24 ч для межциклового контекста батч-анализа.
 RECENT_TITLES_TTL = 24 * 60 * 60
-RECENT_TITLES_LIMIT = 30
+RECENT_TITLES_LIMIT = 60
 _recent_titles: list[dict] = []
 
 # CVE, встреченные в этом процессе: для «сухой» статистики дублей.
@@ -1506,6 +1508,9 @@ def analyze_candidates(
             duplicate_of = entry["duplicate_of"] if entry else None
             overlap = entry["overlap"] if entry else "none"
             cross = bool(entry.get("cross")) if entry else False
+            duplicate_key = None
+            if duplicate_of is not None and 0 <= duplicate_of < len(chunk):
+                duplicate_key = chunk[duplicate_of].get("key")
             if cross:
                 log.info(
                     "[dedup] LLM cross %s: %s ≈ %s",
@@ -1531,6 +1536,7 @@ def analyze_candidates(
                     "title_ru": title_ru,
                     "criticality": extract_criticality(clean_analysis),
                     "duplicate_of": duplicate_of,
+                    "duplicate_key": duplicate_key,
                     "overlap": overlap,
                     "cross_duplicate": cross,
                 }
@@ -1538,6 +1544,18 @@ def analyze_candidates(
 
     rest = [dict(item) for item in ordered[ANALYZE_PER_CYCLE:]]
     return analyzed, rest
+
+
+def _pick_full_duplicate(group: list[dict]) -> dict:
+    """Из группы полных дублей оставляет самую информативную новость."""
+    return max(
+        group,
+        key=lambda item: (
+            item.get("criticality") or 0,
+            len(str(item.get("summary") or "")),
+            str(item.get("published") or ""),
+        ),
+    )
 
 
 def drop_full_duplicates(
@@ -1550,27 +1568,79 @@ def drop_full_duplicates(
     повторно проанализирован. Оригинал при этом остаётся: если его
     сообщение не отправится, новость повторится в следующем цикле.
     """
+    by_key = {item["key"]: item for item in analyzed if item.get("key")}
+    parent: dict[str, str] = {key: key for key in by_key}
+
+    def find(key: str) -> str:
+        root = key
+        while parent[root] != root:
+            root = parent[root]
+        while parent[key] != root:
+            parent[key], key = root, parent[key]
+        return root
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
     duplicates = [
         item
         for item in analyzed
         if item.get("overlap") == "full" and not item.get("cross_duplicate")
     ]
-    if not duplicates:
+    dup_keys = {item["key"] for item in duplicates if item.get("key")}
+    for item in duplicates:
+        key = item.get("key")
+        ref = item.get("duplicate_key")
+        if (
+            isinstance(key, str)
+            and isinstance(ref, str)
+            and key in by_key
+            and ref in by_key
+        ):
+            union(key, ref)
+
+    roots = {find(key) for key in dup_keys}
+    components: dict[str, list[dict]] = {}
+    for key, item in by_key.items():
+        root = find(key)
+        if root in roots:
+            components.setdefault(root, []).append(item)
+
+    dropped_ids: set[int] = set()
+    dropped: list[dict] = []
+
+    # Внутри цикла из каждой группы (в т.ч. цепочки A≈B≈C) оставляем
+    # самую информативную новость.
+    for group in components.values():
+        if len(group) < 2:
+            continue
+        keep = _pick_full_duplicate(group)
+        for item in group:
+            if item is not keep:
+                dropped.append(item)
+                dropped_ids.add(id(item))
+
+    # Межцикловые полные дубли: оригинал уже отправлен ранее.
+    for item in analyzed:
+        if item.get("cross_duplicate") and item.get("overlap") == "full":
+            if id(item) not in dropped_ids:
+                dropped.append(item)
+                dropped_ids.add(id(item))
+
+    if not dropped:
         return analyzed, 0
 
-    remaining = [
-        item
-        for item in analyzed
-        if not (item.get("overlap") == "full" and not item.get("cross_duplicate"))
-    ]
-    seen_urls.update(item["key"] for item in duplicates)
+    remaining = [item for item in analyzed if id(item) not in dropped_ids]
+    seen_urls.update(item["key"] for item in dropped)
     save_seen_urls(seen_urls)
     log.info(
         "[dedup] skipped %d %s (overlap=full)",
-        len(duplicates),
-        plural(len(duplicates), "дубль", "дубля", "дублей"),
+        len(dropped),
+        plural(len(dropped), "дубль", "дубля", "дублей"),
     )
-    return remaining, len(duplicates)
+    return remaining, len(dropped)
 
 
 def build_kev_line(article: dict) -> str:
@@ -1818,6 +1888,15 @@ def deliver_batches(
             else:
                 seen_urls.update([item["key"]])
         save_seen_urls(seen_urls)
+
+        sent_titles: list[dict] = []
+        for item in items:
+            if item.get("zdi_group"):
+                sent_titles.extend(item["items"])
+            elif not item.get("is_kev"):
+                sent_titles.append(item)
+        remember_titles(sent_titles)
+
         sent_messages += 1
         delivered_items += sum(
             len(item["items"]) if item.get("zdi_group") else 1 for item in items
@@ -1890,10 +1969,9 @@ def process_all_feeds(
 
     # 4. Анализ самых свежих.
     analyzed, unanalyzed = analyze_candidates(fresh, client)
-    remember_titles(fresh)
+    cross_dupes = sum(1 for item in analyzed if item.get("cross_duplicate"))
     analyzed, full_dupes = drop_full_duplicates(analyzed, seen_urls)
     partial_dupes = sum(1 for item in analyzed if item.get("overlap") == "partial")
-    cross_dupes = sum(1 for item in analyzed if item.get("cross_duplicate"))
 
     # 5. Классификация: 5 — алерты, остальное — контекст.
     alerts = [item for item in analyzed if item.get("criticality") == 5]

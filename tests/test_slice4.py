@@ -322,8 +322,14 @@ class DropFullDuplicatesTests(unittest.TestCase):
 
     def test_removes_only_full_duplicates(self):
         items = [
-            {"key": "k1", "overlap": "none"},
-            {"key": "k2", "overlap": "full"},
+            {"key": "k1", "overlap": "none", "criticality": 3, "summary": "long"},
+            {
+                "key": "k2",
+                "overlap": "full",
+                "duplicate_key": "k1",
+                "criticality": 2,
+                "summary": "",
+            },
             {"key": "k3", "overlap": "partial"},
         ]
         seen = app.SeenStore(["old"])
@@ -345,14 +351,52 @@ class DropFullDuplicatesTests(unittest.TestCase):
         self.assertEqual(skipped, 0)
         self.assertEqual(self.saved, [])
 
-    def test_cross_cycle_duplicate_not_dropped_yet(self):
+    def test_mutual_duplicates_keep_best(self):
+        items = [
+            {
+                "key": "a",
+                "overlap": "full",
+                "duplicate_key": "b",
+                "criticality": 3,
+                "summary": "short",
+            },
+            {
+                "key": "b",
+                "overlap": "full",
+                "duplicate_key": "a",
+                "criticality": 5,
+                "summary": "much longer summary",
+            },
+        ]
+        seen = app.SeenStore()
+
+        remaining, skipped = app.drop_full_duplicates(items, seen)
+
+        self.assertEqual([item["key"] for item in remaining], ["b"])
+        self.assertEqual(skipped, 1)
+
+    def test_chain_keeps_single_best(self):
+        items = [
+            {"key": "a", "overlap": "full", "duplicate_key": "b", "criticality": 3},
+            {"key": "b", "overlap": "full", "duplicate_key": "c", "criticality": 3},
+            {"key": "c", "overlap": "full", "duplicate_key": "b", "criticality": 4},
+        ]
+        seen = app.SeenStore()
+
+        remaining, skipped = app.drop_full_duplicates(items, seen)
+
+        self.assertEqual([item["key"] for item in remaining], ["c"])
+        self.assertEqual(skipped, 2)
+
+    def test_cross_full_is_dropped(self):
         items = [{"key": "k1", "overlap": "full", "cross_duplicate": True}]
         seen = app.SeenStore()
 
         remaining, skipped = app.drop_full_duplicates(items, seen)
 
-        self.assertEqual(len(remaining), 1)
-        self.assertEqual(skipped, 0)
+        self.assertEqual(remaining, [])
+        self.assertEqual(skipped, 1)
+        self.assertIn("k1", seen)
 
 
 class RecentTitlesTests(unittest.TestCase):

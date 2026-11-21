@@ -251,9 +251,11 @@ class DeliverBatchesTests(unittest.TestCase):
             "save_seen_urls": app.save_seen_urls,
             "DRY_RUN": app.DRY_RUN,
             "MESSAGE_PAUSE_SECONDS": app.MESSAGE_PAUSE_SECONDS,
+            "_recent_titles": app._recent_titles,
         }
         app.save_seen_urls = lambda seen: None
         app.MESSAGE_PAUSE_SECONDS = 0
+        app._recent_titles = []
 
     def tearDown(self):
         for name, value in self.original.items():
@@ -298,6 +300,27 @@ class DeliverBatchesTests(unittest.TestCase):
         self.assertEqual(called, [])
         self.assertEqual(seen, set())
         self.assertEqual((messages, delivered), (1, 0))
+
+    def test_sent_titles_remembered(self):
+        app.send_telegram_message = lambda *args: None
+
+        app.deliver_batches(
+            [("ok", [{"key": "k1", "title": "Story one"}])], "t", "c", set()
+        )
+
+        self.assertEqual(app.recent_titles_snapshot(), ["Story one"])
+
+    def test_kev_titles_not_remembered(self):
+        app.send_telegram_message = lambda *args: None
+
+        app.deliver_batches(
+            [("ok", [{"key": "k1", "title": "CISA KEV: X", "is_kev": True}])],
+            "t",
+            "c",
+            set(),
+        )
+
+        self.assertEqual(app.recent_titles_snapshot(), [])
 
 
 class PipelineTests(unittest.TestCase):
