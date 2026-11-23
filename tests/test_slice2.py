@@ -333,6 +333,33 @@ class DeliverBatchesTests(unittest.TestCase):
 
         self.assertEqual(app.recent_cves_snapshot(), {"CVE-2026-1111"})
 
+    def test_cves_from_analysis_remembered(self):
+        app.send_telegram_message = lambda *args: None
+
+        app.deliver_batches(
+            [
+                (
+                    "ok",
+                    [
+                        {
+                            "key": "k1",
+                            "title": "Critical VMware vCenter flaw",
+                            "summary": "",
+                            "analysis": (
+                                "[Критичность: 5] Суть: эксплуатируют "
+                                "CVE-2026-2222. Детали: патч вышел."
+                            ),
+                        }
+                    ],
+                )
+            ],
+            "t",
+            "c",
+            set(),
+        )
+
+        self.assertEqual(app.recent_cves_snapshot(), {"CVE-2026-2222"})
+
     def test_kev_titles_not_remembered(self):
         app.send_telegram_message = lambda *args: None
 

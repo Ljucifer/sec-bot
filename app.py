@@ -753,14 +753,18 @@ def recent_titles_snapshot() -> list[str]:
 
 
 def remember_titles(items: list[dict]) -> None:
-    """Запоминает заголовки и CVE отправленных новостей для следующих циклов."""
+    """Запоминает заголовки и CVE отправленных новостей для следующих циклов.
+
+    CVE берём и из разбора LLM: в RSS-выжимке номера часто нет, а модель
+    его упоминает — иначе повторы по CVE не ловятся.
+    """
     now = time.time()
     for item in items:
         title = str(item.get("title") or "").strip()
         if title:
-            _recent_titles.append(
-                {"ts": now, "title": title, "cves": item_cves(item)}
-            )
+            cves = item_cves(item)
+            cves |= extract_cves(str(item.get("analysis") or ""))
+            _recent_titles.append({"ts": now, "title": title, "cves": cves})
     _prune_recent_titles(now)
 
 
