@@ -1,0 +1,11 @@
+# Контекст сборки не должен содержать секреты и лишние данные.
+.git
+.github
+.env
+.env.*
+!.env.example
+__pycache__
+*.pyc
+seen_urls.json
+tests
+README.md

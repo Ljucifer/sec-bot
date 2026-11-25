@@ -1419,10 +1419,30 @@ def telegram_retry_after(response: requests.Response) -> float:
         return float(RETRY_DELAY_SECONDS)
 
 
+def _telegram_post(url: str, payload: dict, token: str):
+    """POST в Telegram с одним повтором на сетевую ошибку.
+
+    ConnectionReset/таймаут — частая transient-ошибка; без повтора
+    сообщение ждало бы следующего цикла (6 часов).
+    """
+    try:
+        return requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+    except requests.RequestException as exc:
+        log.warning(
+            "Сетевая ошибка Telegram, повтор через 2 с: %s",
+            mask_secret(str(exc), token),
+        )
+        time.sleep(2)
+        try:
+            return requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+        except requests.RequestException as retry_exc:
+            raise RuntimeError(mask_secret(str(retry_exc), token)) from retry_exc
+
+
 def send_telegram_message(token: str, chat_id: str, text: str) -> None:
     """Отправляет сообщение в Telegram Bot API (sendMessage).
 
-    На 429 ждём retry_after и пробуем один раз.
+    Сетевые ошибки повторяются один раз; на 429 ждём retry_after.
     """
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -1432,18 +1452,11 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
         "disable_web_page_preview": True,
     }
 
-    try:
-        response = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
-    except requests.RequestException as exc:
-        # В тексте сетевой ошибки requests может быть URL с токеном — маскируем.
-        raise RuntimeError(mask_secret(str(exc), token)) from exc
+    response = _telegram_post(url, payload, token)
 
     if response.status_code == 429:
         time.sleep(telegram_retry_after(response))
-        try:
-            response = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
-        except requests.RequestException as exc:
-            raise RuntimeError(mask_secret(str(exc), token)) from exc
+        response = _telegram_post(url, payload, token)
 
     if not response.ok:
         # Тело ответа Telegram содержит описание ошибки — полезно в логах.
@@ -2166,7 +2179,7 @@ def process_all_feeds(
         cross_dupes,
         len(alerts),
         digest_accounted,
-        len(batches),
+        sent_messages,
         delivered_items,
         len(seen_urls),
         DRY_RUN,

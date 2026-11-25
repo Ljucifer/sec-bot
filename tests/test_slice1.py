@@ -4,6 +4,7 @@
 """
 
 import unittest
+from types import SimpleNamespace
 
 import app
 
@@ -367,6 +368,41 @@ class KevTruncationTests(unittest.TestCase):
         )
 
         self.assertNotIn("\ufffd", line)
+
+
+class TelegramRetryTests(unittest.TestCase):
+    def setUp(self):
+        self._post = app.requests.post
+        self._sleep = app.time.sleep
+        app.time.sleep = lambda seconds: None
+
+    def tearDown(self):
+        app.requests.post = self._post
+        app.time.sleep = self._sleep
+
+    def test_network_error_retried_once(self):
+        calls: list[str] = []
+
+        def fake_post(url, **kwargs):
+            calls.append(url)
+            if len(calls) == 1:
+                raise app.requests.RequestException("connection reset")
+            return SimpleNamespace(ok=True, status_code=200, text="")
+
+        app.requests.post = fake_post
+
+        app.send_telegram_message("token", "chat", "text")
+
+        self.assertEqual(len(calls), 2)
+
+    def test_second_failure_raises(self):
+        def fake_post(url, **kwargs):
+            raise app.requests.RequestException("connection reset")
+
+        app.requests.post = fake_post
+
+        with self.assertRaises(RuntimeError):
+            app.send_telegram_message("token", "chat", "text")
 
 
 if __name__ == "__main__":
