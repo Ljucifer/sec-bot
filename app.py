@@ -145,9 +145,9 @@ _recent_titles: list[dict] = []
 # CVE, встреченные в этом процессе: для «сухой» статистики дублей.
 _seen_cves: set[str] = set()
 
-# Сухой детект дублей-историй: совпадение CVE или похожий заголовок (48 ч).
+# Детект дублей-историй: совпадение CVE или почти идентичный заголовок (48 ч).
 STORY_TTL_SECONDS = 48 * 60 * 60
-STORY_SIMILARITY = 0.7
+STORY_SIMILARITY = 0.85
 # Ниже порога, но выше этого значения — логируем «почти совпадение» для калибровки.
 STORY_NEAR_MISS = 0.4
 STORY_STOPWORDS = frozenset(
@@ -656,9 +656,13 @@ def cve_stats(rss_items: list[dict], kev_articles: list[dict]) -> tuple[int, int
 
 
 def _story_words(title: str) -> set[str]:
-    """Значимые слова заголовка: нижний регистр, без стоп-слов и коротких."""
+    """Значимые слова заголовка: без стоп-слов; числа тоже важны (версии)."""
     words = re.findall(r"[a-z0-9]+", title.lower())
-    return {word for word in words if len(word) > 2 and word not in STORY_STOPWORDS}
+    return {
+        word
+        for word in words
+        if (len(word) > 2 or word.isdigit()) and word not in STORY_STOPWORDS
+    }
 
 
 def _is_advisory_title(title: str) -> bool:
@@ -877,9 +881,17 @@ def kev_covered_by_news(kev_articles: list[dict], news_items: list[dict]) -> int
     return covered
 
 
-def story_dupes_stats(items: list[dict]) -> tuple[int, float]:
-    """Сухой детект: (дублей, максимальное сходство), без фильтрации."""
-    duplicates = 0
+def partition_story_duplicates(
+    items: list[dict],
+) -> tuple[list[dict], list[dict], float]:
+    """Делит новости на уникальные и дубли по CVE/заголовку.
+
+    Дубли определяются детерминированно (совпадение CVE или Jaccard
+    >= STORY_SIMILARITY) ещё до обращения к LLM. Уникальные запоминаются
+    для следующих циклов, дубли — нет. Возвращает (уникальные, дубли, max).
+    """
+    unique: list[dict] = []
+    duplicates: list[dict] = []
     max_score = 0.0
 
     for item in items:
@@ -887,23 +899,30 @@ def story_dupes_stats(items: list[dict]) -> tuple[int, float]:
         max_score = max(max_score, score)
 
         if story is not None and score >= STORY_SIMILARITY:
-            duplicates += 1
+            duplicates.append(item)
             log.info(
-                "[dedup] would skip: %s ≈ %s",
+                "[dedup] story: %s ≈ %s",
                 item.get("title"),
                 story["title"],
             )
-        elif story is not None and score >= STORY_NEAR_MISS:
-            log.info(
-                "[dedup] near miss (%.2f): %s ≈ %s",
-                score,
-                item.get("title"),
-                story["title"],
-            )
+        else:
+            if story is not None and score >= STORY_NEAR_MISS:
+                log.info(
+                    "[dedup] near miss (%.2f): %s ≈ %s",
+                    score,
+                    item.get("title"),
+                    story["title"],
+                )
+            unique.append(item)
+            remember_story(item)
 
-        remember_story(item)
+    return unique, duplicates, max_score
 
-    return duplicates, max_score
+
+def story_dupes_stats(items: list[dict]) -> tuple[int, float]:
+    """Совместимость: (сколько дублей, максимальное сходство)."""
+    _, duplicates, max_score = partition_story_duplicates(items)
+    return len(duplicates), max_score
 
 
 def iso_date(raw: str) -> str | None:
@@ -2030,10 +2049,22 @@ def process_all_feeds(
 
     # 3. Дедупликация: уже отправленное + дубли внутри цикла.
     fresh, dup_seen, dup_cycle = dedupe_items(rss_items, seen_urls)
+    rss_new = len(fresh)
 
-    # 3а. Сухая статистика по CVE и дублям-историям (поведение не меняет).
+    # 3а. Дубли по заголовку/CVE — детерминированно, до обращения к LLM.
+    fresh, story_duplicates, story_max = partition_story_duplicates(fresh)
+    story_dupes = len(story_duplicates)
+    if story_duplicates:
+        seen_urls.update(item["key"] for item in story_duplicates)
+        save_seen_urls(seen_urls)
+        log.info(
+            "[dedup] skipped %d %s (story)",
+            len(story_duplicates),
+            plural(len(story_duplicates), "дубль", "дубля", "дублей"),
+        )
+
+    # 3б. Сухая статистика по CVE и KEV.
     cve_total, cve_dupes = cve_stats(fresh, kev_articles)
-    story_dupes, story_max = story_dupes_stats(fresh)
     kev_covered = kev_covered_by_news(kev_articles, fresh)
 
     # 4. Анализ самых свежих.
@@ -2118,7 +2149,7 @@ def process_all_feeds(
         "delivered=%d seen=%d dry_run=%s",
         len(rss_items) + len(kev_articles),
         len(kev_articles),
-        len(fresh),
+        rss_new,
         window_dropped,
         dup_seen,
         dup_cycle,

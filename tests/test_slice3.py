@@ -117,6 +117,41 @@ class SeenFileTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path + ".tmp"))
 
 
+class PartitionStoryTests(unittest.TestCase):
+    def setUp(self):
+        self._original = app._recent_stories
+        app._recent_stories = []
+
+    def tearDown(self):
+        app._recent_stories = self._original
+
+    @staticmethod
+    def _item(title, link="https://e.com/1"):
+        return {"title": title, "link": link, "summary": ""}
+
+    def test_identical_titles_are_split(self):
+        items = [
+            self._item("Peninsula Energy Halts Trading After Cyber Incident"),
+            self._item("Peninsula Energy Halts Trading After Cyber Incident"),
+        ]
+
+        unique, duplicates, score = app.partition_story_duplicates(items)
+
+        self.assertEqual(len(unique), 1)
+        self.assertEqual(len(duplicates), 1)
+        self.assertEqual(score, 1.0)
+
+    def test_duplicates_not_remembered(self):
+        items = [
+            self._item("Peninsula Energy Halts Trading After Cyber Incident"),
+            self._item("Peninsula Energy Halts Trading After Cyber Incident"),
+        ]
+
+        app.partition_story_duplicates(items)
+
+        self.assertEqual(len(app._recent_stories), 1)
+
+
 class CveExtractionTests(unittest.TestCase):
     def test_extracts_from_title_summary_and_link(self):
         item = {
@@ -191,7 +226,7 @@ class StoryDedupTests(unittest.TestCase):
             [self._item("Zyxel GS1900 patch fails to block zero-day exploit")]
         )
         duplicates, score = app.story_dupes_stats(
-            [self._item("Zyxel GS1900 patch fails to block zero-day attacks")]
+            [self._item("Zyxel GS1900 patch fails to block zero-day exploit in attacks")]
         )
 
         self.assertEqual(duplicates, 1)
