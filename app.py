@@ -362,8 +362,10 @@ def save_seen_urls(seen: SeenStore) -> None:
         except OSError:
             # EBUSY/EXDEV: файл смонтирован, подменить его нельзя.
             pass
-    except OSError as exc:
-        log.error("Не удалось записать %s: %s", tmp_path, exc)
+    except OSError:
+        # read_only-корень: временный файл создать нельзя, пишем напрямую
+        # в смонтированный seen_urls.json (это ожидаемый режим).
+        pass
 
     # Резервный путь: перезапись на месте (работает и для bind-mount).
     try:

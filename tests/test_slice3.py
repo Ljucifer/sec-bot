@@ -116,6 +116,15 @@ class SeenFileTests(unittest.TestCase):
         self.assertEqual(self._read(), ["https://a"])
         self.assertFalse(os.path.exists(self.path + ".tmp"))
 
+    def test_tmp_unavailable_still_saves_silently(self):
+        # read_only-корень: временный файл создать нельзя.
+        os.mkdir(self.path + ".tmp")
+
+        with self.assertNoLogs("sec-bot", level="ERROR"):
+            app.save_seen_urls(app.SeenStore(["https://a"]))
+
+        self.assertEqual(self._read(), ["https://a"])
+
 
 class PartitionStoryTests(unittest.TestCase):
     def setUp(self):
